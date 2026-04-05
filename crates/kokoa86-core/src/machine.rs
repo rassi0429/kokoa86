@@ -56,6 +56,28 @@ impl Machine {
         self.mem.load(addr, data);
     }
 
+    /// Load a BIOS ROM image (typically 256KB SeaBIOS).
+    /// Maps at the top of the first 1MB (so 256KB ROM at 0xC0000-0xFFFFF,
+    /// or 64KB ROM at 0xF0000-0xFFFFF). Sets reset vector.
+    pub fn load_bios(&mut self, data: Vec<u8>) {
+        let size = data.len() as u32;
+        let base = 0x100000u32.saturating_sub(size); // e.g., 0xC0000 for 256KB
+        log::info!("Mapping BIOS ROM ({} KB) at 0x{:05X}-0xFFFFF", size / 1024, base);
+        self.mem.map_rom(base, data);
+
+        // Set CPU to BIOS reset vector: CS=0xF000, IP=0xFFF0
+        // This is the standard x86 reset vector at physical 0xFFFF0
+        self.cpu.cs = 0xF000;
+        self.cpu.eip = 0xFFF0;
+        // Real mode defaults
+        self.cpu.ds = 0x0000;
+        self.cpu.es = 0x0000;
+        self.cpu.ss = 0x0000;
+        self.cpu.esp = 0x0000;
+        self.cpu.halted = false;
+        self.bios_stubs = false; // BIOS handles its own interrupts
+    }
+
     /// Load a disk image
     pub fn load_disk(&mut self, data: Vec<u8>) {
         self.ata.load_image(data);

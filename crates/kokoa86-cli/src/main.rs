@@ -7,10 +7,14 @@ use std::fs;
 #[derive(Parser)]
 #[command(name = "kokoa86", about = "x86 PC emulator", version)]
 struct Args {
-    /// Binary file to load (flat binary, loaded at 0x7C00 by default)
-    binary: String,
+    /// Binary file to load (flat binary at --load-addr)
+    binary: Option<String>,
 
-    /// Load address (hex, default: 0x7C00)
+    /// BIOS ROM image (e.g., SeaBIOS bios.bin)
+    #[arg(short, long)]
+    bios: Option<String>,
+
+    /// Load address for flat binary (hex, default: 7C00)
     #[arg(short, long, default_value = "7c00")]
     load_addr: String,
 
@@ -18,7 +22,7 @@ struct Args {
     #[arg(short, long, default_value_t = 1024)]
     ram: usize,
 
-    /// Disk image file (loaded as ATA primary drive)
+    /// Disk image file
     #[arg(short, long)]
     disk: Option<String>,
 
@@ -34,19 +38,6 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let load_addr =
-        usize::from_str_radix(&args.load_addr, 16).context("Invalid load address")?;
-
-    let data = fs::read(&args.binary)
-        .with_context(|| format!("Failed to read binary: {}", args.binary))?;
-
-    log::info!(
-        "Loading {} ({} bytes) at 0x{:05X}",
-        args.binary,
-        data.len(),
-        load_addr
-    );
-
     let mut machine = Machine::new(args.ram * 1024);
     machine.bios_stubs = !args.no_bios_stubs;
 
@@ -57,24 +48,34 @@ fn main() -> Result<()> {
     if let Some(ref disk_path) = args.disk {
         let disk_data = fs::read(disk_path)
             .with_context(|| format!("Failed to read disk image: {}", disk_path))?;
-        log::info!("Loading disk image: {} ({} bytes, {} sectors)",
-            disk_path, disk_data.len(), disk_data.len() / 512);
+        log::info!("Disk: {} ({} bytes, {} sectors)", disk_path, disk_data.len(), disk_data.len() / 512);
         machine.load_disk(disk_data);
     }
 
-    // Load binary
-    machine.load_at(load_addr, &data);
-
-    // Set initial SP to top of conventional memory
-    machine.cpu.esp = 0xFFFE;
-    machine.cpu.ss = 0x0000;
-    machine.cpu.eip = load_addr as u32;
-    machine.cpu.cs = 0x0000;
+    // Load BIOS or flat binary
+    if let Some(ref bios_path) = args.bios {
+        let bios_data = fs::read(bios_path)
+            .with_context(|| format!("Failed to read BIOS: {}", bios_path))?;
+        log::info!("BIOS: {} ({} KB)", bios_path, bios_data.len() / 1024);
+        machine.load_bios(bios_data);
+    } else if let Some(ref binary) = args.binary {
+        let load_addr = usize::from_str_radix(&args.load_addr, 16)
+            .context("Invalid load address")?;
+        let data = fs::read(binary)
+            .with_context(|| format!("Failed to read: {}", binary))?;
+        log::info!("Loading {} ({} bytes) at 0x{:05X}", binary, data.len(), load_addr);
+        machine.load_at(load_addr, &data);
+        machine.cpu.eip = load_addr as u32;
+        machine.cpu.cs = 0x0000;
+        machine.cpu.esp = 0xFFFE;
+        machine.cpu.ss = 0x0000;
+    } else {
+        anyhow::bail!("Specify a binary file or --bios option");
+    }
 
     machine.run()?;
 
     println!();
     log::info!("Emulation finished");
-
     Ok(())
 }

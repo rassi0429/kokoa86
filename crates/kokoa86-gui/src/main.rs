@@ -14,6 +14,10 @@ struct Args {
     /// Binary file to load
     binary: Option<String>,
 
+    /// BIOS ROM image (e.g., SeaBIOS bios.bin)
+    #[arg(short = 'B', long)]
+    bios: Option<String>,
+
     /// Load address (hex, default: 7C00)
     #[arg(short, long, default_value = "7c00")]
     load_addr: String,
@@ -89,7 +93,18 @@ impl EmulatorApp {
 
         let status;
 
-        if let Some(ref path) = args.binary {
+        if let Some(ref bios_path) = args.bios {
+            match fs::read(bios_path) {
+                Ok(bios_data) => {
+                    let size = bios_data.len();
+                    machine.load_bios(bios_data);
+                    status = format!("BIOS loaded: {} ({} KB) - Press Run", bios_path, size / 1024);
+                }
+                Err(e) => {
+                    status = format!("BIOS load error: {}", e);
+                }
+            }
+        } else if let Some(ref path) = args.binary {
             match Self::load_binary(&mut machine, path, &args.load_addr) {
                 Ok(msg) => status = msg,
                 Err(e) => status = format!("Error: {}", e),
