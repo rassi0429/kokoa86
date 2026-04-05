@@ -266,3 +266,18 @@ mod tests {
         assert_eq!(val, 0xDEAD_BEEF);
     }
 }
+
+
+#[cfg(test)]
+mod test_extra {
+    use super::*;
+    #[test]
+    fn test_pci_readw_device_id_via_cfe() {
+        let mut pci = PciBus::new().with_default_devices();
+        pci.port_out(0xCF8, 4, 0x80000800);
+        let vendor = pci.port_in(0xCFC, 2);
+        assert_eq!(vendor, 0x8086, "vendor");
+        let device = pci.port_in(0xCFE, 2);
+        assert_eq!(device, 0x7000, "device ID via port 0xCFE");
+    }
+}

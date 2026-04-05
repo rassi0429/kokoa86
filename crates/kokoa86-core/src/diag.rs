@@ -7,7 +7,6 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
     let mut output = String::new();
     let mut last_serial_len = 0usize;
     let mut alloc_count = 0u32;
-    let mut trace_next = 0u64; // trace N instructions starting from this
 
     for i in 0..max_inst {
         let lip = machine.cpu.cs_ip();
@@ -22,30 +21,38 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
             last_serial_len = machine.serial_output.len();
         }
 
-        // Trace when requested
-        if i >= trace_next && i < trace_next + 200 && trace_next > 0 {
-            let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, lip);
-            let mut bytes = String::new();
-            for j in 0..inst.len.min(8) as u32 {
-                bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(lip + j)));
-            }
-            output.push_str(&format!("{:>8}: {:08X} {:<20} {:?}  A={:08X} B={:08X}\n",
-                i, lip, bytes.trim(), inst.op, machine.cpu.eax, machine.cpu.ebx));
-        }
+        if lip == 0x0FFAD462 { alloc_count += 1; }
 
-        // Count alloc_new calls
-        if lip == 0x0FFAD462 {
-            alloc_count += 1;
-            if alloc_count == 5 {
-                // Trace 200 instructions BEFORE the next alloc to see the loop
-                output.push_str(&format!("\n=== Tracing around 5th alloc (inst {}) ===\n", i));
-                // We can't go back, so trace starting now
-                trace_next = i;
+        // Trace the caller of alloc #6 (the 3rd pci_device alloc)
+        // alloc #5 is size=32 at inst ~73411
+        // Trace 700 instructions from inst 73411 to see the full iteration
+        if alloc_count == 5 && lip == 0x0FFAD462 {
+            output.push_str(&format!("\n=== Tracing iteration around alloc #5 (inst {}) ===\n", i));
+            // Trace backwards is impossible, so trace forward 700 inst
+            for j in 0..1200u64 {
+                let ii = i + j;
+                let ll = machine.cpu.cs_ip();
+                let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, ll);
+                let mut bytes = String::new();
+                for k in 0..inst.len.min(6) as u32 {
+                    bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(ll + k)));
+                }
+                // Only show CALL, RET, JMP, and key MOV/CMP
+                // Show everything except memset inner loop and alloc_new inner loop
+                let show = !(ll >= 0x000EA973 && ll <= 0x000EA97B)  // skip memset
+                    && !(ll >= 0x0FFAD46E && ll <= 0x0FFAD4A3);  // skip alloc walk
+                if show {
+                    output.push_str(&format!("{:>8}: {:08X} {:<18} {:?}  A={:08X} B={:08X} DI={:08X} FL={:04X}\n",
+                        ii, ll, bytes.trim(), inst.op,
+                        machine.cpu.eax, machine.cpu.ebx, machine.cpu.edi, machine.cpu.eflags as u16));
+                }
+                match machine.step() {
+                    Ok(ExecResult::Continue) => {}
+                    Ok(ExecResult::Halt) => { output.push_str("HALT\n"); break; }
+                    _ => {}
+                }
             }
-            // Don't stop — let it run
-            if alloc_count % 100 == 0 {
-                output.push_str(&format!("[alloc #{}]\n", alloc_count));
-            }
+            break;
         }
 
         match machine.step() {
