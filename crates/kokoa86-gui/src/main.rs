@@ -72,6 +72,7 @@ struct EmulatorApp {
     show_registers: bool,
     show_memory: bool,
     show_disasm: bool,
+    show_serial: bool,
     memory_addr: String,
     error: Option<String>,
     #[allow(dead_code)]
@@ -128,6 +129,7 @@ impl EmulatorApp {
             show_registers: true,
             show_memory: false,
             show_disasm: true,
+            show_serial: true,
             memory_addr: "7C00".to_string(),
             error: None,
             serial_output: String::new(),
@@ -245,6 +247,7 @@ impl eframe::App for EmulatorApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_registers, "Registers (right panel)");
                     ui.checkbox(&mut self.show_disasm, "Disassembly (bottom)");
+                    ui.checkbox(&mut self.show_serial, "Serial Output");
                     ui.checkbox(&mut self.show_memory, "Memory Viewer");
                 });
                 ui.menu_button("Help", |ui| {
@@ -378,6 +381,29 @@ impl eframe::App for EmulatorApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             render_vga_display(ui, &self.machine.vga);
         });
+
+        // Serial output window
+        if self.show_serial {
+            let serial_text = String::from_utf8_lossy(&self.machine.serial_output).into_owned();
+            let serial_len = self.machine.serial_output.len();
+            egui::Window::new("Serial / Debug Output")
+                .open(&mut self.show_serial)
+                .default_size([600.0, 300.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("{} bytes", serial_len));
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(&serial_text)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(0x00, 0xFF, 0x80)),
+                            );
+                        });
+                });
+        }
 
         // Memory viewer window
         if self.show_memory {

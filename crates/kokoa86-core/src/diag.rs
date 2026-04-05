@@ -48,7 +48,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
         // Trace normally
         // Trace qemu_preinit and nearby
         let lip = machine.cpu.cs_ip();
-        if i >= 58460 && i <= 58480 {
+        if false {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();
             let mut bytes = String::new();
