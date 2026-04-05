@@ -76,7 +76,7 @@ impl Machine {
     }
 
     /// Copy RAM at 0xB8000 into VGA text buffer (for display sync)
-    fn sync_vga_from_ram(&mut self) {
+    pub fn sync_vga_from_ram(&mut self) {
         let base = vga::VGA_TEXT_BASE;
         let size = (vga::VGA_COLS * vga::VGA_ROWS * 2) as u32;
         for i in 0..size {

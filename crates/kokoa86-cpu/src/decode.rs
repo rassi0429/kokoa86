@@ -158,6 +158,27 @@ impl AluOp {
     }
 }
 
+/// Decode an instruction at an arbitrary linear address (for disassembly)
+pub fn decode_at_addr(cpu: &CpuState, mem: &MemoryBus, addr: u32) -> Instruction {
+    let mut pos: u32 = 0;
+    let fetch8 = |off: u32| -> u8 { mem.read_u8(addr.wrapping_add(off)) };
+    let opcode_byte = fetch8(pos);
+
+    if opcode_byte == 0xF3 || opcode_byte == 0xF2 {
+        pos += 1;
+        let inner = decode_at(cpu, mem, addr, &mut pos);
+        let _ = inner.len;
+        let wrapped = if opcode_byte == 0xF3 {
+            Opcode::Rep(Box::new(inner.op))
+        } else {
+            Opcode::Repne(Box::new(inner.op))
+        };
+        return Instruction { op: wrapped, len: pos as u8 };
+    }
+
+    decode_at(cpu, mem, addr, &mut pos)
+}
+
 /// Decode the next instruction at CS:IP
 pub fn decode(cpu: &CpuState, mem: &MemoryBus) -> Instruction {
     let base = cpu.cs_ip();

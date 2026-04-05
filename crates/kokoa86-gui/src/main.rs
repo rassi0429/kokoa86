@@ -3,8 +3,9 @@ use clap::Parser;
 use eframe::egui;
 use kokoa86_core::Machine;
 use kokoa86_cpu::execute::ExecResult;
-use kokoa86_dev::Serial8250;
 use kokoa86_dev::vga;
+use kokoa86_dev::Serial8250;
+use kokoa86_mem::MemoryAccess;
 use std::fs;
 
 #[derive(Parser)]
@@ -31,8 +32,8 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 700.0])
-            .with_title("kokoa86 — x86 Emulator"),
+            .with_inner_size([1100.0, 750.0])
+            .with_title("kokoa86 - x86 Emulator"),
         ..Default::default()
     };
 
@@ -40,23 +41,33 @@ fn main() -> Result<()> {
         "kokoa86",
         options,
         Box::new(move |cc| {
-            // Set dark theme
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            cc.egui_ctx.set_visuals(dark_theme());
             Ok(Box::new(EmulatorApp::new(args)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }
 
+fn dark_theme() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = egui::Color32::from_rgb(0x1A, 0x1A, 0x2E);
+    v.window_fill = egui::Color32::from_rgb(0x16, 0x16, 0x2B);
+    v.extreme_bg_color = egui::Color32::from_rgb(0x0F, 0x0F, 0x1A);
+    v
+}
+
 struct EmulatorApp {
     machine: Machine,
     running: bool,
-    speed: usize, // instructions per frame
+    speed: usize,
     status: String,
     show_registers: bool,
     show_memory: bool,
+    show_disasm: bool,
     memory_addr: String,
     error: Option<String>,
+    #[allow(dead_code)]
+    serial_output: String,
 }
 
 impl EmulatorApp {
@@ -68,20 +79,18 @@ impl EmulatorApp {
 
         if let Some(ref path) = args.binary {
             match Self::load_binary(&mut machine, path, &args.load_addr) {
-                Ok(msg) => {
-                    status = msg;
-                }
-                Err(e) => {
-                    status = format!("Error: {}", e);
-                }
+                Ok(msg) => status = msg,
+                Err(e) => status = format!("Error: {}", e),
             }
         } else {
-            // Load built-in demo program
             let demo = kokoa86_core::demo::demo_program();
             machine.load_at(0x7C00, &demo);
             machine.cpu.eip = 0x7C00;
             machine.cpu.esp = 0xFFFE;
-            status = format!("Demo program loaded ({} bytes). Press Run to start!", demo.len());
+            status = format!(
+                "Demo loaded ({} bytes) - Press Run or F5",
+                demo.len()
+            );
         }
 
         Self {
@@ -91,8 +100,10 @@ impl EmulatorApp {
             status,
             show_registers: true,
             show_memory: false,
+            show_disasm: true,
             memory_addr: "7C00".to_string(),
             error: None,
+            serial_output: String::new(),
         }
     }
 
@@ -106,8 +117,6 @@ impl EmulatorApp {
         machine.cpu.esp = 0xFFFE;
         machine.cpu.ss = 0x0000;
         machine.cpu.halted = false;
-
-        // Also write a demo to VGA buffer if no file loaded
         Ok(format!("Loaded {} ({} bytes) at 0x{:05X}", path, len, load_addr))
     }
 
@@ -134,180 +143,211 @@ impl EmulatorApp {
             }
             Err(e) => {
                 self.running = false;
-                self.error = Some(format!("Error: {}", e));
+                self.error = Some(format!("{}", e));
             }
         }
+    }
+
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::F5) {
+                self.running = !self.running;
+                if self.running {
+                    self.machine.cpu.halted = false;
+                }
+            }
+            if i.key_pressed(egui::Key::F10) {
+                self.running = false;
+                let _ = self.machine.step();
+                self.machine.sync_vga_from_ram();
+            }
+            if i.key_pressed(egui::Key::F2) {
+                self.do_reset();
+            }
+        });
+    }
+
+    fn do_reset(&mut self) {
+        self.running = false;
+        self.machine.cpu = kokoa86_cpu::CpuState::default();
+        self.machine.cpu.eip = 0x7C00;
+        self.machine.cpu.esp = 0xFFFE;
+        self.machine.instruction_count = 0;
+        self.error = None;
+        self.status = "Reset".to_string();
     }
 }
 
 impl eframe::App for EmulatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Run emulation
+        self.handle_keys(ctx);
         self.step_emulation();
 
-        // Request repaint if running
         if self.running {
             ctx.request_repaint();
         }
 
-        // Top menu bar
+        // Menu bar
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Load Binary...").clicked() {
-                        if let Some(path) = rfd_open_file() {
-                            match Self::load_binary(
-                                &mut self.machine,
-                                &path,
-                                "7c00",
-                            ) {
-                                Ok(msg) => {
-                                    self.status = msg;
-                                    self.error = None;
-                                    self.running = false;
-                                }
-                                Err(e) => {
-                                    self.error = Some(format!("Load error: {}", e));
-                                }
-                            }
-                        }
-                        ui.close_menu();
-                    }
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_registers, "Registers");
+                    ui.checkbox(&mut self.show_registers, "Registers (right panel)");
+                    ui.checkbox(&mut self.show_disasm, "Disassembly (bottom)");
                     ui.checkbox(&mut self.show_memory, "Memory Viewer");
                 });
-            });
-        });
-
-        // Bottom status bar
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(ref err) = self.error {
-                    ui.colored_label(egui::Color32::RED, err);
-                } else {
-                    ui.label(&self.status);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("Instructions: {}", self.machine.instruction_count));
+                ui.menu_button("Help", |ui| {
+                    if ui.button("Keyboard Shortcuts").clicked() {
+                        ui.close_menu();
+                    }
+                    ui.label("F5: Run/Pause  F10: Step  F2: Reset");
                 });
             });
         });
 
-        // Control panel
+        // Control bar
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().item_spacing.x = 6.0;
 
-                let run_text = if self.running { "\u{23F8} Pause" } else { "\u{25B6} Run" };
-                if ui.button(run_text).clicked() {
+                let btn_size = egui::vec2(70.0, 24.0);
+
+                let run_label = if self.running { "Pause" } else { "Run" };
+                let run_color = if self.running {
+                    egui::Color32::from_rgb(0xFF, 0x99, 0x33)
+                } else {
+                    egui::Color32::from_rgb(0x33, 0xCC, 0x66)
+                };
+                if ui
+                    .add_sized(
+                        btn_size,
+                        egui::Button::new(
+                            egui::RichText::new(run_label).strong().color(run_color),
+                        ),
+                    )
+                    .clicked()
+                {
                     self.running = !self.running;
                     if self.running {
                         self.machine.cpu.halted = false;
                     }
                 }
 
-                if ui.button("\u{23ED} Step").clicked() {
+                if ui
+                    .add_sized(btn_size, egui::Button::new("Step"))
+                    .clicked()
+                {
                     self.running = false;
                     let _ = self.machine.step();
+                    self.machine.sync_vga_from_ram();
                 }
 
-                if ui.button("\u{23F9} Reset").clicked() {
-                    self.running = false;
-                    self.machine.cpu = kokoa86_cpu::CpuState::default();
-                    self.machine.cpu.eip = 0x7C00;
-                    self.machine.cpu.esp = 0xFFFE;
-                    self.machine.instruction_count = 0;
-                    self.error = None;
-                    self.status = "Reset".to_string();
+                if ui
+                    .add_sized(btn_size, egui::Button::new("Reset"))
+                    .clicked()
+                {
+                    self.do_reset();
                 }
 
                 ui.separator();
-                ui.label("Speed:");
-                ui.add(egui::Slider::new(&mut self.speed, 1..=100_000).logarithmic(true));
 
-                if self.machine.cpu.halted {
-                    ui.colored_label(egui::Color32::YELLOW, "HALTED");
+                ui.label("Speed:");
+                ui.add(
+                    egui::Slider::new(&mut self.speed, 1..=500_000)
+                        .logarithmic(true)
+                        .suffix(" inst/frame"),
+                );
+
+                ui.separator();
+
+                // Status indicator
+                let (indicator, color) = if self.machine.cpu.halted {
+                    ("HALTED", egui::Color32::from_rgb(0xFF, 0xCC, 0x00))
                 } else if self.running {
-                    ui.colored_label(egui::Color32::GREEN, "RUNNING");
+                    ("RUNNING", egui::Color32::from_rgb(0x00, 0xFF, 0x80))
                 } else {
-                    ui.label("PAUSED");
+                    ("PAUSED", egui::Color32::from_rgb(0x88, 0x88, 0x88))
+                };
+                ui.label(egui::RichText::new(indicator).monospace().strong().color(color));
+            });
+            ui.add_space(2.0);
+        });
+
+        // Status bar
+        egui::TopBottomPanel::bottom("status").min_height(22.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(ref err) = self.error {
+                    ui.colored_label(egui::Color32::from_rgb(0xFF, 0x55, 0x55), format!("Error: {}", err));
+                } else {
+                    ui.label(
+                        egui::RichText::new(&self.status)
+                            .small()
+                            .color(egui::Color32::from_rgb(0x99, 0x99, 0xBB)),
+                    );
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "IP:{:04X}:{:04X}  Inst:{}",
+                            self.machine.cpu.cs,
+                            self.machine.cpu.eip,
+                            self.machine.instruction_count
+                        ))
+                        .monospace()
+                        .small()
+                        .color(egui::Color32::from_rgb(0x88, 0xAA, 0xCC)),
+                    );
+                });
             });
         });
 
-        // Side panel: registers
+        // Right panel: registers + flags
         if self.show_registers {
             egui::SidePanel::right("registers")
-                .default_width(220.0)
+                .default_width(200.0)
+                .min_width(180.0)
                 .show(ctx, |ui| {
-                    ui.heading("Registers");
-                    ui.separator();
-
-                    let cpu = &self.machine.cpu;
-                    egui::Grid::new("reg_grid")
-                        .num_columns(2)
-                        .spacing([10.0, 4.0])
-                        .show(ui, |ui| {
-                            reg_row(ui, "AX", cpu.eax as u16);
-                            reg_row(ui, "BX", cpu.ebx as u16);
-                            reg_row(ui, "CX", cpu.ecx as u16);
-                            reg_row(ui, "DX", cpu.edx as u16);
-                            ui.end_row();
-                            reg_row(ui, "SP", cpu.esp as u16);
-                            reg_row(ui, "BP", cpu.ebp as u16);
-                            reg_row(ui, "SI", cpu.esi as u16);
-                            reg_row(ui, "DI", cpu.edi as u16);
-                            ui.end_row();
-                            reg_row(ui, "CS", cpu.cs);
-                            reg_row(ui, "DS", cpu.ds);
-                            reg_row(ui, "ES", cpu.es);
-                            reg_row(ui, "SS", cpu.ss);
-                            ui.end_row();
-                            reg_row(ui, "IP", cpu.eip as u16);
-                            ui.label("FLAGS");
-                            ui.label(format!("{:016b}", cpu.eflags as u16));
-                            ui.end_row();
-                        });
-
-                    ui.separator();
-                    ui.heading("Flags");
-                    ui.horizontal_wrapped(|ui| {
-                        let f = cpu.eflags;
-                        flag_label(ui, "CF", f & 1 != 0);
-                        flag_label(ui, "ZF", f & (1 << 6) != 0);
-                        flag_label(ui, "SF", f & (1 << 7) != 0);
-                        flag_label(ui, "OF", f & (1 << 11) != 0);
-                        flag_label(ui, "IF", f & (1 << 9) != 0);
-                        flag_label(ui, "DF", f & (1 << 10) != 0);
-                    });
+                    render_registers(ui, &self.machine.cpu);
                 });
         }
 
-        // Central panel: VGA display
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("VGA Display (Text Mode 80x25)");
-            ui.separator();
+        // Bottom panel: disassembly
+        if self.show_disasm {
+            egui::TopBottomPanel::bottom("disasm")
+                .default_height(150.0)
+                .min_height(80.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    render_disassembly(ui, &self.machine);
+                });
+        }
 
-            render_vga_text(ui, &self.machine.vga);
+        // Central: VGA display
+        egui::CentralPanel::default().show(ctx, |ui| {
+            render_vga_display(ui, &self.machine.vga);
         });
 
         // Memory viewer window
         if self.show_memory {
             egui::Window::new("Memory Viewer")
                 .open(&mut self.show_memory)
-                .default_size([400.0, 300.0])
+                .default_size([480.0, 350.0])
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Address (hex):");
-                        ui.text_edit_singleline(&mut self.memory_addr);
+                        ui.label("Address:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.memory_addr)
+                                .desired_width(80.0)
+                                .font(egui::FontId::monospace(13.0)),
+                        );
+                        if ui.button("Go").clicked() {}
                     });
                     ui.separator();
-
                     if let Ok(addr) = u32::from_str_radix(self.memory_addr.trim(), 16) {
                         render_memory_dump(ui, &self.machine.mem, addr, 256);
                     }
@@ -316,81 +356,245 @@ impl eframe::App for EmulatorApp {
     }
 }
 
-fn reg_row(ui: &mut egui::Ui, name: &str, val: u16) {
-    ui.label(egui::RichText::new(name).monospace().strong());
-    ui.label(
-        egui::RichText::new(format!("{:04X}", val))
-            .monospace()
-            .color(egui::Color32::from_rgb(0x80, 0xCC, 0xFF)),
-    );
-    ui.end_row();
-}
+// ============================================================
+// Rendering helpers
+// ============================================================
 
-fn flag_label(ui: &mut egui::Ui, name: &str, set: bool) {
-    let color = if set {
-        egui::Color32::from_rgb(0x00, 0xFF, 0x80)
-    } else {
-        egui::Color32::from_rgb(0x60, 0x60, 0x60)
-    };
-    ui.label(egui::RichText::new(name).monospace().color(color));
-}
+fn render_registers(ui: &mut egui::Ui, cpu: &kokoa86_cpu::CpuState) {
+    let header_color = egui::Color32::from_rgb(0xCC, 0x99, 0xFF);
+    let val_color = egui::Color32::from_rgb(0x80, 0xDD, 0xFF);
 
-fn render_vga_text(ui: &mut egui::Ui, vga: &kokoa86_dev::VgaText) {
-    let cells = vga.render_cells();
+    ui.label(egui::RichText::new("CPU Registers").strong().color(header_color));
+    ui.separator();
 
-    // Use a monospace layout
-    egui::ScrollArea::both().show(ui, |ui| {
-        let font_id = egui::FontId::monospace(14.0);
-
-        for row in 0..vga::VGA_ROWS {
-            let mut job = egui::text::LayoutJob::default();
-            for col in 0..vga::VGA_COLS {
-                let (ch, fg, bg) = cells[row * vga::VGA_COLS + col];
-                let fg_color = egui::Color32::from_rgb(fg[0], fg[1], fg[2]);
-                let bg_color = egui::Color32::from_rgb(bg[0], bg[1], bg[2]);
-
-                job.append(
-                    &ch.to_string(),
-                    0.0,
-                    egui::TextFormat {
-                        font_id: font_id.clone(),
-                        color: fg_color,
-                        background: bg_color,
-                        ..Default::default()
-                    },
-                );
+    egui::Grid::new("regs")
+        .num_columns(2)
+        .spacing([8.0, 3.0])
+        .show(ui, |ui| {
+            for (name, val) in [
+                ("AX", cpu.eax as u16),
+                ("BX", cpu.ebx as u16),
+                ("CX", cpu.ecx as u16),
+                ("DX", cpu.edx as u16),
+            ] {
+                ui.label(egui::RichText::new(name).monospace().strong().small());
+                ui.label(egui::RichText::new(format!("{:04X}", val)).monospace().color(val_color).small());
+                ui.end_row();
             }
-            ui.label(job);
+            ui.label("");
+            ui.label("");
+            ui.end_row();
+            for (name, val) in [
+                ("SP", cpu.esp as u16),
+                ("BP", cpu.ebp as u16),
+                ("SI", cpu.esi as u16),
+                ("DI", cpu.edi as u16),
+            ] {
+                ui.label(egui::RichText::new(name).monospace().strong().small());
+                ui.label(egui::RichText::new(format!("{:04X}", val)).monospace().color(val_color).small());
+                ui.end_row();
+            }
+            ui.label("");
+            ui.label("");
+            ui.end_row();
+            for (name, val) in [
+                ("CS", cpu.cs),
+                ("DS", cpu.ds),
+                ("ES", cpu.es),
+                ("SS", cpu.ss),
+                ("FS", cpu.fs),
+                ("GS", cpu.gs),
+            ] {
+                ui.label(egui::RichText::new(name).monospace().strong().small());
+                ui.label(egui::RichText::new(format!("{:04X}", val)).monospace().color(val_color).small());
+                ui.end_row();
+            }
+            ui.label("");
+            ui.label("");
+            ui.end_row();
+            ui.label(egui::RichText::new("IP").monospace().strong().small());
+            ui.label(
+                egui::RichText::new(format!("{:04X}", cpu.eip as u16))
+                    .monospace()
+                    .color(egui::Color32::from_rgb(0xFF, 0xCC, 0x55))
+                    .small(),
+            );
+            ui.end_row();
+        });
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Flags").strong().color(header_color));
+    ui.separator();
+
+    ui.horizontal_wrapped(|ui| {
+        let f = cpu.eflags;
+        for (name, bit) in [
+            ("CF", 0),
+            ("PF", 2),
+            ("AF", 4),
+            ("ZF", 6),
+            ("SF", 7),
+            ("IF", 9),
+            ("DF", 10),
+            ("OF", 11),
+        ] {
+            let set = (f >> bit) & 1 != 0;
+            let color = if set {
+                egui::Color32::from_rgb(0x00, 0xFF, 0x80)
+            } else {
+                egui::Color32::from_rgb(0x44, 0x44, 0x55)
+            };
+            ui.label(egui::RichText::new(name).monospace().small().color(color));
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(format!("EFLAGS: {:08X}", cpu.eflags))
+            .monospace()
+            .small()
+            .color(egui::Color32::from_rgb(0x77, 0x77, 0x99)),
+    );
+}
+
+fn render_vga_display(ui: &mut egui::Ui, vga_state: &kokoa86_dev::VgaText) {
+    let cells = vga_state.render_cells();
+
+    // VGA display with a dark frame
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(0x00, 0x00, 0x00))
+        .inner_margin(8.0)
+        .outer_margin(4.0)
+        .corner_radius(4.0)
+        .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(0x33, 0x33, 0x55)))
+        .show(ui, |ui| {
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let font_id = egui::FontId::monospace(13.0);
+
+                    for row in 0..vga::VGA_ROWS {
+                        let mut job = egui::text::LayoutJob::default();
+                        for col in 0..vga::VGA_COLS {
+                            let (ch, fg, bg) = cells[row * vga::VGA_COLS + col];
+                            let fg_color = egui::Color32::from_rgb(fg[0], fg[1], fg[2]);
+                            let bg_color = egui::Color32::from_rgb(bg[0], bg[1], bg[2]);
+
+                            job.append(
+                                &ch.to_string(),
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: font_id.clone(),
+                                    color: fg_color,
+                                    background: bg_color,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        ui.label(job);
+                    }
+                });
+        });
+}
+
+fn render_disassembly(ui: &mut egui::Ui, machine: &Machine) {
+    let header_color = egui::Color32::from_rgb(0xCC, 0x99, 0xFF);
+    ui.label(egui::RichText::new("Disassembly").strong().color(header_color));
+    ui.separator();
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        let font = egui::FontId::monospace(12.0);
+        let current_ip = machine.cpu.cs_ip();
+
+        // Show ~15 instructions around current IP
+        let mut addr = current_ip;
+        for _ in 0..15 {
+            let inst = kokoa86_cpu::decode::decode_at_addr(&machine.cpu, &machine.mem, addr);
+
+            let is_current = addr == current_ip;
+            let prefix = if is_current { ">" } else { " " };
+
+            // Read raw bytes
+            let mut bytes_str = String::new();
+            for i in 0..inst.len as u32 {
+                bytes_str.push_str(&format!("{:02X} ", machine.mem.read_u8(addr + i)));
+            }
+
+            let line = format!(
+                "{} {:04X}:{:04X}  {:<18} {:?}",
+                prefix,
+                machine.cpu.cs,
+                addr as u16,
+                bytes_str.trim(),
+                inst.op
+            );
+
+            let color = if is_current {
+                egui::Color32::from_rgb(0xFF, 0xFF, 0x55)
+            } else {
+                egui::Color32::from_rgb(0xAA, 0xBB, 0xCC)
+            };
+
+            ui.label(egui::RichText::new(line).font(font.clone()).color(color));
+
+            addr += inst.len as u32;
         }
     });
 }
 
 fn render_memory_dump(ui: &mut egui::Ui, mem: &kokoa86_mem::MemoryBus, start: u32, len: u32) {
-    use kokoa86_mem::MemoryAccess;
-
     egui::ScrollArea::vertical().show(ui, |ui| {
         let font = egui::FontId::monospace(12.0);
+        let addr_color = egui::Color32::from_rgb(0x88, 0x88, 0xAA);
+        let hex_color = egui::Color32::from_rgb(0xBB, 0xDD, 0xFF);
+        let ascii_color = egui::Color32::from_rgb(0x88, 0xCC, 0x88);
+
         for row_start in (start..start + len).step_by(16) {
-            let mut hex = format!("{:05X}: ", row_start);
+            let mut job = egui::text::LayoutJob::default();
+
+            // Address
+            job.append(
+                &format!("{:05X}: ", row_start),
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color: addr_color,
+                    ..Default::default()
+                },
+            );
+
+            // Hex bytes
             let mut ascii = String::new();
-            for i in 0..16 {
+            for i in 0..16u32 {
                 let byte = mem.read_u8(row_start + i);
-                hex.push_str(&format!("{:02X} ", byte));
+                job.append(
+                    &format!("{:02X} ", byte),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        color: hex_color,
+                        ..Default::default()
+                    },
+                );
                 if byte >= 0x20 && byte < 0x7F {
                     ascii.push(byte as char);
                 } else {
                     ascii.push('.');
                 }
             }
-            hex.push_str(&format!(" {}", ascii));
-            ui.label(egui::RichText::new(hex).font(font.clone()));
+
+            // ASCII
+            job.append(
+                &format!(" {}", ascii),
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color: ascii_color,
+                    ..Default::default()
+                },
+            );
+
+            ui.label(job);
         }
     });
-}
-
-/// Simple file dialog (no rfd crate — just returns None for now, user can use CLI)
-fn rfd_open_file() -> Option<String> {
-    // Would use rfd crate for native file dialog, but keeping deps minimal
-    // Users can pass binary path via CLI argument
-    None
 }
