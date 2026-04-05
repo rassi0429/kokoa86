@@ -1,5 +1,6 @@
 pub mod ata;
 pub mod cmos;
+pub mod fw_cfg;
 pub mod misc;
 pub mod pci;
 pub mod pic;
@@ -11,6 +12,7 @@ pub mod vga;
 
 pub use ata::AtaDisk;
 pub use cmos::Cmos;
+pub use fw_cfg::FwCfg;
 pub use pci::PciBus;
 pub use pic::Pic8259;
 pub use pit::Pit8253;

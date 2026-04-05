@@ -2,7 +2,7 @@ use anyhow::Result;
 use kokoa86_cpu::decode;
 use kokoa86_cpu::execute::{self, ExecResult, IntHandler, PortIo};
 use kokoa86_cpu::CpuState;
-use kokoa86_dev::{AtaDisk, Cmos, PciBus, Pic8259, Pit8253, PortBus, Ps2Controller, VgaText, vga};
+use kokoa86_dev::{AtaDisk, Cmos, FwCfg, PciBus, Pic8259, Pit8253, PortBus, Ps2Controller, VgaText, vga};
 use kokoa86_dev::port_bus::PortDevice;
 use kokoa86_mem::{MemoryAccess, MemoryBus};
 
@@ -37,8 +37,7 @@ impl Machine {
             pit: Pit8253::new(),
             ps2: Ps2Controller::new(),
             ata: AtaDisk::new(),
-            cmos: Cmos::new((ram_size / 1024).min(640) as u16,
-                            if ram_size > 1024*1024 { ((ram_size - 1024*1024) / 1024) as u16 } else { 0 }),
+            cmos: Cmos::new_with_ram(ram_size),
             pci: PciBus::new().with_default_devices(),
             bios_stubs: true,
             instruction_count: 0,
@@ -50,6 +49,7 @@ impl Machine {
         m.ports.register(Box::new(kokoa86_dev::misc::SystemControlB::new()));
         m.ports.register(Box::new(kokoa86_dev::misc::DmaStub::new()));
         m.ports.register(Box::new(kokoa86_dev::misc::DmaPageRegs::new()));
+        m.ports.register(Box::new(FwCfg::new(ram_size as u64)));
         m.ports.register(Box::new(kokoa86_dev::misc::Dma2Stub));
         m
     }
@@ -257,6 +257,7 @@ impl PortIo for DevicePortAdapter<'_> {
             0x40..=0x43 => return self.pit.port_in(port, size),
             0x60 | 0x64 => return self.ps2.port_in(port, size),
             0xE9 => return 0xE9, // QEMU ISA debug port (present)
+            0x402 => return 0xE9, // QEMU debugcon port (present)
             0x70..=0x71 => return self.cmos.port_in(port, size),
             0xCF8..=0xCFF => return self.pci.port_in(port, size),
             0x1F0..=0x1F7 | 0x3F6 => return self.ata.port_in(port, size),
@@ -267,8 +268,8 @@ impl PortIo for DevicePortAdapter<'_> {
     }
 
     fn port_out(&mut self, port: u16, size: u8, val: u32) {
-        // Capture serial output (COM1 THR) and QEMU debug port (0xE9)
-        if (port == 0x3F8 || port == 0xE9) && size == 1 {
+        // Capture serial output (COM1 THR, QEMU debug port 0xE9/0x402)
+        if (port == 0x3F8 || port == 0xE9 || port == 0x402) && size == 1 {
             self.serial_capture.push(val as u8);
         }
         match port {

@@ -13,7 +13,7 @@ fn diag_seabios_boot() {
         }
     };
 
-    let mut machine = Machine::new(16 * 1024 * 1024); // 16MB RAM
+    let mut machine = Machine::new(32 * 1024 * 1024); // 32MB RAM
     let serial = Serial8250::new_capture(0x3F8);
     machine.ports.register(Box::new(serial));
     machine.load_bios(bios_data);
@@ -48,6 +48,12 @@ fn diag_seabios_boot() {
     let edx = machine.cpu.get_reg32(2);
     println!("EDX (2nd param): 0x{:08X}", edx);
     // Check memory at what should be stack with fmt string
+    // Check CMOS RAM registers directly
+    use kokoa86_dev::port_bus::PortDevice;
+    machine.cmos.port_out(0x70, 1, 0x34);
+    println!("CMOS[0x34] = {:02X}", machine.cmos.port_in(0x71, 1));
+    machine.cmos.port_out(0x70, 1, 0x35);
+    println!("CMOS[0x35] = {:02X}", machine.cmos.port_in(0x71, 1));
     println!("mem[0xF6034] (serial debug port): {:08X}", machine.mem.read_u32(0xF6034));
     println!("mem[0x400] (BDA COM1): {:04X}", machine.mem.read_u16(0x400));
     println!("mem[0x6FD0] = {:08X}", machine.mem.read_u32(0x6FD0));
