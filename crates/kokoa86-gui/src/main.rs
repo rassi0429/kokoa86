@@ -3,7 +3,8 @@ use clap::Parser;
 use eframe::egui;
 use kokoa86_core::Machine;
 use kokoa86_cpu::execute::ExecResult;
-use kokoa86_dev::{Serial8250, vga};
+use kokoa86_dev::Serial8250;
+use kokoa86_dev::vga;
 use std::fs;
 
 #[derive(Parser)]
@@ -52,7 +53,6 @@ struct EmulatorApp {
     running: bool,
     speed: usize, // instructions per frame
     status: String,
-    loaded: bool,
     show_registers: bool,
     show_memory: bool,
     memory_addr: String,
@@ -64,19 +64,24 @@ impl EmulatorApp {
         let mut machine = Machine::new(args.ram * 1024);
         machine.ports.register(Box::new(Serial8250::new(0x3F8)));
 
-        let mut loaded = false;
-        let mut status = "No binary loaded. Drag & drop a .bin file or use File > Load.".to_string();
+        let status;
 
         if let Some(ref path) = args.binary {
             match Self::load_binary(&mut machine, path, &args.load_addr) {
                 Ok(msg) => {
                     status = msg;
-                    loaded = true;
                 }
                 Err(e) => {
                     status = format!("Error: {}", e);
                 }
             }
+        } else {
+            // Load built-in demo program
+            let demo = kokoa86_core::demo::demo_program();
+            machine.load_at(0x7C00, &demo);
+            machine.cpu.eip = 0x7C00;
+            machine.cpu.esp = 0xFFFE;
+            status = format!("Demo program loaded ({} bytes). Press Run to start!", demo.len());
         }
 
         Self {
@@ -84,7 +89,6 @@ impl EmulatorApp {
             running: false,
             speed: 10000,
             status,
-            loaded,
             show_registers: true,
             show_memory: false,
             memory_addr: "7C00".to_string(),
@@ -105,31 +109,6 @@ impl EmulatorApp {
 
         // Also write a demo to VGA buffer if no file loaded
         Ok(format!("Loaded {} ({} bytes) at 0x{:05X}", path, len, load_addr))
-    }
-
-    fn load_demo(&mut self) {
-        // Write "kokoa86 x86 Emulator" to VGA text buffer directly
-        let msg = b"kokoa86 x86 Emulator - Ready";
-        for (i, &ch) in msg.iter().enumerate() {
-            self.machine.vga.mem_write((i * 2) as u32, ch);
-            self.machine.vga.mem_write((i * 2 + 1) as u32, 0x0F); // white on black
-        }
-
-        // Second line
-        let msg2 = b"Load a binary to start emulation";
-        let row2_offset = vga::VGA_COLS * 2;
-        for (i, &ch) in msg2.iter().enumerate() {
-            self.machine.vga.mem_write((row2_offset + i * 2) as u32, ch);
-            self.machine.vga.mem_write((row2_offset + i * 2 + 1) as u32, 0x07);
-        }
-
-        // Colorful third line
-        let msg3 = b"Phase 1: Real Mode CPU";
-        let row3_offset = vga::VGA_COLS * 4;
-        for (i, &ch) in msg3.iter().enumerate() {
-            self.machine.vga.mem_write((row3_offset + i * 2) as u32, ch);
-            self.machine.vga.mem_write((row3_offset + i * 2 + 1) as u32, 0x01 + (i as u8 % 15));
-        }
     }
 
     fn step_emulation(&mut self) {
@@ -163,12 +142,6 @@ impl EmulatorApp {
 
 impl eframe::App for EmulatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Load demo text on first frame if nothing loaded
-        if !self.loaded {
-            self.load_demo();
-            self.loaded = true;
-        }
-
         // Run emulation
         self.step_emulation();
 

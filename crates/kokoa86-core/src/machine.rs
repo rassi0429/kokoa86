@@ -2,8 +2,8 @@ use anyhow::Result;
 use kokoa86_cpu::decode;
 use kokoa86_cpu::execute::{self, ExecResult, IntHandler, PortIo};
 use kokoa86_cpu::CpuState;
-use kokoa86_dev::{PortBus, VgaText};
-use kokoa86_mem::MemoryBus;
+use kokoa86_dev::{PortBus, VgaText, vga};
+use kokoa86_mem::{MemoryAccess, MemoryBus};
 
 /// The main emulator machine — owns all components
 pub struct Machine {
@@ -65,10 +65,23 @@ impl Machine {
         for _ in 0..n {
             match self.step()? {
                 ExecResult::Continue => {}
-                other => return Ok(other),
+                other => {
+                    self.sync_vga_from_ram();
+                    return Ok(other);
+                }
             }
         }
+        self.sync_vga_from_ram();
         Ok(ExecResult::Continue)
+    }
+
+    /// Copy RAM at 0xB8000 into VGA text buffer (for display sync)
+    fn sync_vga_from_ram(&mut self) {
+        let base = vga::VGA_TEXT_BASE;
+        let size = (vga::VGA_COLS * vga::VGA_ROWS * 2) as u32;
+        for i in 0..size {
+            self.vga.buffer[i as usize] = self.mem.read_u8(base + i);
+        }
     }
 
     /// Run until HLT or error
