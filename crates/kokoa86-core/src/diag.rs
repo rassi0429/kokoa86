@@ -52,6 +52,63 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_first: u64) -> Str
         }
 
         // When stuck in loop for 100K iterations, trace 100 instructions then break
+        // Trace all PCI config port accesses after probing starts
+        if false && i > 67390 && i < 70000 {
+            // Catch OUT to 0xCF8 and IN from 0xCFC
+            let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, lip);
+            match &inst.op {
+                kokoa86_cpu::decode::Opcode::OutDxAx | kokoa86_cpu::decode::Opcode::OutDxAl => {
+                    let dx = machine.cpu.get_reg16(2);
+                    if dx == 0xCF8 {
+                        output.push_str(&format!("PCI OUT 0xCF8 = {:08X} at inst {}\n", machine.cpu.eax, i));
+                    }
+                }
+                kokoa86_cpu::decode::Opcode::InAxDx | kokoa86_cpu::decode::Opcode::InAlDx => {
+                    let dx = machine.cpu.get_reg16(2);
+                    if dx >= 0xCF8 && dx <= 0xCFF {
+                        // Read will happen AFTER step, so record dx for post-step check
+                        output.push_str(&format!("PCI IN 0x{:03X} at inst {} (pre-step AX={:08X})\n", dx, i, machine.cpu.eax));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Check PCIDevices linked list once
+        if i == 100_000 && !loop_traced {
+            output.push_str("\n=== PCIDevices list (0x0E9720 relocated) ===\n");
+            // Try both original and relocated addresses
+            for base_name in ["orig 0x0E9720", "reloc 0x0FFBFF20"] {
+                let base_addr = if base_name.contains("orig") { 0x0E9720u32 } else { 0x0FFBFF20u32 };
+                let first = machine.mem.read_u32(base_addr);
+                output.push_str(&format!("{}: first={:08X}\n", base_name, first));
+                let mut node = first;
+                for j in 0..20 {
+                    if node == 0 { break; }
+                    let next = machine.mem.read_u32(node); // hlist_node.next
+                    let pprev = machine.mem.read_u32(node + 4);
+                    let bdf = machine.mem.read_u16(node.wrapping_sub(0));
+                    // pci_device: bdf(u16) at offset 0, then rootbus(u8), then hlist_node at offset 4
+                    let dev_bdf = machine.mem.read_u16(node.wrapping_sub(4)); // bdf is 4 bytes before node
+                    output.push_str(&format!("  [{:2}] node={:08X} next={:08X} pprev={:08X} bdf={:04X}\n",
+                        j, node, next, pprev, dev_bdf));
+                    if next == node { output.push_str("  !!! CIRCULAR\n"); break; }
+                    node = next;
+                }
+            }
+        }
+        if loop_count == 12_000 && !loop_traced {
+            // Dump call stack (return addresses on stack)
+            output.push_str("\n=== Call stack at loop entry ===\n");
+            let sp = machine.cpu.esp;
+            for j in 0..20u32 {
+                let addr = sp + j * 4;
+                let val = machine.mem.read_u32(addr);
+                // Filter for likely return addresses (in code range)
+                if val > 0x0C0000 && val < 0x10000000 {
+                    output.push_str(&format!("  [SP+{:02X}] = {:08X}\n", j*4, val));
+                }
+            }
+        }
         if loop_count == 15_000 && !loop_traced {
             loop_traced = true;
             output.push_str(&format!(
