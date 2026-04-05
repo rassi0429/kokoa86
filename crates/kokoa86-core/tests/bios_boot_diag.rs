@@ -13,12 +13,12 @@ fn diag_seabios_boot() {
         }
     };
 
-    let mut machine = Machine::new(128 * 1024 * 1024); // 128MB RAM
+    let mut machine = Machine::new(256 * 1024 * 1024); // 256MB RAM
     let serial = Serial8250::new_capture(0x3F8);
     machine.ports.register(Box::new(serial));
     machine.load_bios(bios_data);
 
-    let report = kokoa86_core::diag::trace_boot(&mut machine, 50_000_000, 50);
+    let report = kokoa86_core::diag::trace_boot(&mut machine, 1_000_000, 50);
     println!("{}", report);
 
     // Serial output from SeaBIOS
@@ -120,7 +120,8 @@ fn diag_seabios_boot() {
 
     // Check RamSize global variable at 0x0E9718 (found from ROM analysis)
     println!("\n=== RamSize check ===");
-    println!("RamSize @ 0x0E9718 = 0x{:08X}", machine.mem.read_u32(0x0E9718));
+    println!("RamSize @ 0x0E9718 (orig) = 0x{:08X}", machine.mem.read_u32(0x0E9718));
+    println!("RamSize @ 0x0FFBFF18 (reloc) = 0x{:08X}", machine.mem.read_u32(0x0FFBFF18));
 
     // Verify fw_cfg file directory
     {

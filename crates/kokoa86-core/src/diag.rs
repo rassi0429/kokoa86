@@ -75,7 +75,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
                 addr += inst.len as u32;
             }
         }
-        if i >= 200_000 && i < 200_020 {
+        if i >= 200_000 && i < 200_100 {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();
             let mut bytes = String::new();
