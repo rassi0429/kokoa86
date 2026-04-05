@@ -2,7 +2,8 @@ use anyhow::Result;
 use kokoa86_cpu::decode;
 use kokoa86_cpu::execute::{self, ExecResult, IntHandler, PortIo};
 use kokoa86_cpu::CpuState;
-use kokoa86_dev::{PortBus, VgaText, vga};
+use kokoa86_dev::{AtaDisk, Pic8259, Pit8253, PortBus, Ps2Controller, VgaText, vga};
+use kokoa86_dev::port_bus::PortDevice;
 use kokoa86_mem::{MemoryAccess, MemoryBus};
 
 /// The main emulator machine — owns all components
@@ -11,6 +12,11 @@ pub struct Machine {
     pub mem: MemoryBus,
     pub ports: PortBus,
     pub vga: VgaText,
+    pub pic_master: Pic8259,
+    pub pic_slave: Pic8259,
+    pub pit: Pit8253,
+    pub ps2: Ps2Controller,
+    pub ata: AtaDisk,
     pub bios_stubs: bool,
     pub instruction_count: u64,
 }
@@ -22,6 +28,11 @@ impl Machine {
             mem: MemoryBus::new(ram_size),
             ports: PortBus::new(),
             vga: VgaText::new(),
+            pic_master: Pic8259::new(0x20, true),
+            pic_slave: Pic8259::new(0xA0, false),
+            pit: Pit8253::new(),
+            ps2: Ps2Controller::new(),
+            ata: AtaDisk::new(),
             bios_stubs: true,
             instruction_count: 0,
         }
@@ -32,17 +43,63 @@ impl Machine {
         self.mem.load(addr, data);
     }
 
+    /// Load a disk image
+    pub fn load_disk(&mut self, data: Vec<u8>) {
+        self.ata.load_image(data);
+    }
+
     /// Execute a single instruction
     pub fn step(&mut self) -> Result<ExecResult> {
         if self.cpu.halted {
             return Ok(ExecResult::Halt);
         }
 
+        // Tick PIT (roughly 1 PIT tick per ~10 CPU instructions)
+        if self.instruction_count % 10 == 0 {
+            self.pit.tick(1);
+        }
+
+        // Check device IRQs and feed to PIC
+        if self.pit.check_irq0() {
+            self.pic_master.raise_irq(0);
+        }
+        if self.ps2.check_irq1() {
+            self.pic_master.raise_irq(1);
+        }
+        if self.ata.irq14_pending {
+            self.ata.irq14_pending = false;
+            self.pic_slave.raise_irq(6); // IRQ14 = slave IRQ6
+        }
+        // Cascade: if slave has interrupt, raise IRQ2 on master
+        if self.pic_slave.has_interrupt() {
+            self.pic_master.raise_irq(2);
+        }
+
+        // Check for pending hardware interrupt
+        if kokoa86_cpu::flags::get_flag(&self.cpu, kokoa86_cpu::flags::FLAG_IF) {
+            if let Some(vector) = self.pic_master.get_interrupt() {
+                if vector == self.pic_master.vector_offset + 2 {
+                    // Cascade: acknowledge from slave
+                    if let Some(slave_vec) = self.pic_slave.get_interrupt() {
+                        // Dispatch slave interrupt
+                        dispatch_hw_interrupt(&mut self.cpu, &mut self.mem, slave_vec);
+                    }
+                } else {
+                    dispatch_hw_interrupt(&mut self.cpu, &mut self.mem, vector);
+                }
+            }
+        }
+
         let inst = decode::decode(&self.cpu, &self.mem);
 
-        let mut port_adapter = PortVgaAdapter {
+        let mut port_adapter = DevicePortAdapter {
             bus: &mut self.ports,
             vga: &mut self.vga,
+            pic_master: &mut self.pic_master,
+            pic_slave: &mut self.pic_slave,
+            pit: &mut self.pit,
+            ps2: &mut self.ps2,
+            ata: &mut self.ata,
         };
         let mut int_adapter = BiosStubHandler {
             enabled: self.bios_stubs,
@@ -95,7 +152,6 @@ impl Machine {
                 }
                 ExecResult::DivideError => {
                     log::warn!("Divide error at {:04X}:{:04X}", self.cpu.cs, self.cpu.eip);
-                    // TODO: dispatch #DE exception
                 }
                 ExecResult::UnknownOpcode(byte) => {
                     anyhow::bail!(
@@ -111,19 +167,47 @@ impl Machine {
     }
 }
 
-/// Adapter: PortBus + VGA I/O
-struct PortVgaAdapter<'a> {
-    bus: &'a mut PortBus,
-    vga: &'a mut VgaText,
+/// Dispatch a hardware interrupt in real mode (push FLAGS, CS, IP; load from IVT)
+fn dispatch_hw_interrupt(cpu: &mut CpuState, mem: &mut MemoryBus, vector: u8) {
+    // Save flags, CS, IP
+    let sp = cpu.get_reg16(4).wrapping_sub(2);
+    let ss_base = (cpu.ss as u32) << 4;
+    mem.write_u16(ss_base + sp as u32, cpu.eflags as u16);
+    let sp = sp.wrapping_sub(2);
+    mem.write_u16(ss_base + sp as u32, cpu.cs);
+    let sp = sp.wrapping_sub(2);
+    mem.write_u16(ss_base + sp as u32, cpu.eip as u16);
+    cpu.set_reg16(4, sp);
+
+    // Clear IF and TF
+    cpu.eflags &= !(kokoa86_cpu::flags::FLAG_IF | kokoa86_cpu::flags::FLAG_TF);
+
+    // Load CS:IP from IVT
+    let ivt_addr = (vector as u32) * 4;
+    cpu.eip = mem.read_u16(ivt_addr) as u32;
+    cpu.cs = mem.read_u16(ivt_addr + 2);
 }
 
-impl PortIo for PortVgaAdapter<'_> {
+/// Unified port adapter that routes to all devices
+struct DevicePortAdapter<'a> {
+    bus: &'a mut PortBus,
+    vga: &'a mut VgaText,
+    pic_master: &'a mut Pic8259,
+    pic_slave: &'a mut Pic8259,
+    pit: &'a mut Pit8253,
+    ps2: &'a mut Ps2Controller,
+    ata: &'a mut AtaDisk,
+}
+
+impl PortIo for DevicePortAdapter<'_> {
     fn port_in(&mut self, port: u16, size: u8) -> u32 {
-        // VGA ports
         match port {
-            0x3C0..=0x3CF | 0x3D4..=0x3DA => {
-                return self.vga.port_in(port) as u32;
-            }
+            0x20..=0x21 => return self.pic_master.port_in(port, size),
+            0xA0..=0xA1 => return self.pic_slave.port_in(port, size),
+            0x40..=0x43 => return self.pit.port_in(port, size),
+            0x60 | 0x64 => return self.ps2.port_in(port, size),
+            0x1F0..=0x1F7 | 0x3F6 => return self.ata.port_in(port, size),
+            0x3C0..=0x3CF | 0x3D4..=0x3DA => return self.vga.port_in(port) as u32,
             _ => {}
         }
         self.bus.port_in(port, size)
@@ -131,17 +215,19 @@ impl PortIo for PortVgaAdapter<'_> {
 
     fn port_out(&mut self, port: u16, size: u8, val: u32) {
         match port {
-            0x3C0..=0x3CF | 0x3D4..=0x3DA => {
-                self.vga.port_out(port, val as u8);
-                return;
-            }
+            0x20..=0x21 => { self.pic_master.port_out(port, size, val); return; }
+            0xA0..=0xA1 => { self.pic_slave.port_out(port, size, val); return; }
+            0x40..=0x43 => { self.pit.port_out(port, size, val); return; }
+            0x60 | 0x64 => { self.ps2.port_out(port, size, val); return; }
+            0x1F0..=0x1F7 | 0x3F6 => { self.ata.port_out(port, size, val); return; }
+            0x3C0..=0x3CF | 0x3D4..=0x3DA => { self.vga.port_out(port, val as u8); return; }
             _ => {}
         }
         self.bus.port_out(port, size, val);
     }
 }
 
-/// BIOS interrupt stub handler (INT 0x10 for teletype output)
+/// BIOS interrupt stub handler
 struct BiosStubHandler {
     enabled: bool,
 }
@@ -154,11 +240,10 @@ impl IntHandler for BiosStubHandler {
 
         match vector {
             0x10 => {
-                let ah = cpu.get_reg8(4); // AH
+                let ah = cpu.get_reg8(4);
                 match ah {
                     0x0E => {
-                        // Teletype output: AL = character
-                        let ch = cpu.get_reg8(0); // AL
+                        let ch = cpu.get_reg8(0);
                         print!("{}", ch as char);
                         true
                     }
