@@ -170,12 +170,14 @@ pub fn decode(cpu: &CpuState, mem: &MemoryBus) -> Instruction {
     if opcode_byte == 0xF3 || opcode_byte == 0xF2 {
         pos += 1;
         let inner = decode_at(cpu, mem, base, &mut pos);
+        let _ = inner.len; // inner.len includes bytes from pos=1 onward
         let wrapped = if opcode_byte == 0xF3 {
             Opcode::Rep(Box::new(inner.op))
         } else {
             Opcode::Repne(Box::new(inner.op))
         };
-        return Instruction { op: wrapped, len: inner.len + 1 };
+        // pos already includes the REP prefix byte + inner bytes
+        return Instruction { op: wrapped, len: pos as u8 };
     }
 
     decode_at(cpu, mem, base, &mut pos)
