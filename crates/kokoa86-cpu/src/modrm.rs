@@ -18,9 +18,19 @@ pub fn decode_modrm(
     addr: u32,
     addr_size: AddrSize,
 ) -> (u8, ModrmOperand, u8) {
+    decode_modrm_seg(cpu, mem, addr, addr_size, None)
+}
+
+pub fn decode_modrm_seg(
+    cpu: &CpuState,
+    mem: &MemoryBus,
+    addr: u32,
+    addr_size: AddrSize,
+    seg_override: Option<u8>,
+) -> (u8, ModrmOperand, u8) {
     match addr_size {
-        AddrSize::Addr16 => decode_modrm16(cpu, mem, addr),
-        AddrSize::Addr32 => decode_modrm32(cpu, mem, addr),
+        AddrSize::Addr16 => decode_modrm16_seg(cpu, mem, addr, seg_override),
+        AddrSize::Addr32 => decode_modrm32_seg(cpu, mem, addr, seg_override),
     }
 }
 
@@ -29,6 +39,15 @@ pub fn decode_modrm16(
     cpu: &CpuState,
     mem: &MemoryBus,
     addr: u32,
+) -> (u8, ModrmOperand, u8) {
+    decode_modrm16_seg(cpu, mem, addr, None)
+}
+
+pub fn decode_modrm16_seg(
+    cpu: &CpuState,
+    mem: &MemoryBus,
+    addr: u32,
+    seg_override: Option<u8>,
 ) -> (u8, ModrmOperand, u8) {
     let modrm = mem.read_u8(addr);
     let mod_field = (modrm >> 6) & 0x03;
@@ -43,7 +62,8 @@ pub fn decode_modrm16(
         0x00 => {
             if rm == 0x06 {
                 let disp = mem.read_u16(addr + 1);
-                let linear = calc_linear16(cpu, cpu.ds, disp as u32);
+                let seg = override_or_default_seg16(cpu, rm, seg_override);
+                let linear = calc_linear16(cpu, seg, disp as u32);
                 return (reg, ModrmOperand::Mem(linear), 3);
             }
             (calc_rm16_base(cpu, rm), 0u8)
@@ -59,7 +79,7 @@ pub fn decode_modrm16(
         _ => unreachable!(),
     };
 
-    let seg = default_segment16(cpu, rm);
+    let seg = override_or_default_seg16(cpu, rm, seg_override);
     let linear = calc_linear16(cpu, seg, base_addr);
 
     (reg, ModrmOperand::Mem(linear), 1 + extra_bytes)
@@ -70,6 +90,15 @@ pub fn decode_modrm32(
     cpu: &CpuState,
     mem: &MemoryBus,
     addr: u32,
+) -> (u8, ModrmOperand, u8) {
+    decode_modrm32_seg(cpu, mem, addr, None)
+}
+
+pub fn decode_modrm32_seg(
+    cpu: &CpuState,
+    mem: &MemoryBus,
+    addr: u32,
+    seg_override: Option<u8>,
 ) -> (u8, ModrmOperand, u8) {
     let modrm = mem.read_u8(addr);
     let mod_field = (modrm >> 6) & 0x03;
@@ -137,13 +166,22 @@ pub fn decode_modrm32(
         _ => unreachable!(),
     };
 
-    // Apply segment base
-    let seg = if use_ss { cpu.ss } else { cpu.ds };
-    let linear = if cpu.mode == CpuMode::ProtectedMode {
-        let cache = if use_ss { &cpu.ss_cache } else { &cpu.ds_cache };
-        cache.base.wrapping_add(final_addr)
+    // Apply segment base (with override support)
+    let linear = if let Some(ovr) = seg_override {
+        let seg_val = cpu.get_sreg(ovr);
+        if cpu.mode == CpuMode::ProtectedMode {
+            get_seg_cache(cpu, ovr).base.wrapping_add(final_addr)
+        } else {
+            ((seg_val as u32) << 4).wrapping_add(final_addr)
+        }
     } else {
-        ((seg as u32) << 4).wrapping_add(final_addr)
+        let seg = if use_ss { cpu.ss } else { cpu.ds };
+        if cpu.mode == CpuMode::ProtectedMode {
+            let cache = if use_ss { &cpu.ss_cache } else { &cpu.ds_cache };
+            cache.base.wrapping_add(final_addr)
+        } else {
+            ((seg as u32) << 4).wrapping_add(final_addr)
+        }
     };
 
     (reg, ModrmOperand::Mem(linear), bytes_consumed)
@@ -169,6 +207,28 @@ fn default_segment16(cpu: &CpuState, rm: u8) -> u16 {
     match rm {
         2 | 3 | 6 => cpu.ss,
         _ => cpu.ds,
+    }
+}
+
+/// Get segment register value when there's an override, or use default
+fn override_or_default_seg16(cpu: &CpuState, rm: u8, seg_override: Option<u8>) -> u16 {
+    if let Some(ovr) = seg_override {
+        cpu.get_sreg(ovr)
+    } else {
+        default_segment16(cpu, rm)
+    }
+}
+
+/// Get segment cache by index (ES=0, CS=1, SS=2, DS=3, FS=4, GS=5)
+fn get_seg_cache(cpu: &CpuState, idx: u8) -> &crate::regs::SegmentCache {
+    match idx {
+        0 => &cpu.es_cache,
+        1 => &cpu.cs_cache,
+        2 => &cpu.ss_cache,
+        3 => &cpu.ds_cache,
+        4 => &cpu.fs_cache,
+        5 => &cpu.gs_cache,
+        _ => &cpu.ds_cache,
     }
 }
 

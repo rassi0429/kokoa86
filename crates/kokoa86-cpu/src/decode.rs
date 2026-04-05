@@ -1,5 +1,5 @@
 use kokoa86_mem::{MemoryAccess, MemoryBus};
-use crate::modrm::{ModrmOperand, decode_modrm};
+use crate::modrm::{ModrmOperand, decode_modrm_seg};
 use crate::regs::{AddrSize, CpuState, OperandSize};
 
 // Re-export for tests
@@ -363,7 +363,7 @@ fn decode_opcode(
     };
 
     let modrm = |p: &mut u32| -> (u8, ModrmOperand, u8) {
-        decode_modrm(cpu, mem, base + *p, _addr_size)
+        decode_modrm_seg(cpu, mem, base + *p, _addr_size, _seg_override)
     };
 
     let opcode_byte = fetch8(*pos);
@@ -423,7 +423,7 @@ fn decode_opcode(
         0x1F => Opcode::PopRegv(3), // POP DS
 
         // Two-byte opcodes (0x0F)
-        0x0F => decode_0f(cpu, mem, base, pos, operand_size, _addr_size),
+        0x0F => decode_0f(cpu, mem, base, pos, operand_size, _addr_size, _seg_override),
 
         // INC rv
         0x40..=0x47 => Opcode::IncRegv(opcode_byte - 0x40),
@@ -801,6 +801,7 @@ fn decode_0f(
     pos: &mut u32,
     operand_size: OperandSize,
     addr_size: AddrSize,
+    seg_override: Option<u8>,
 ) -> Opcode {
     let fetch8 = |off: u32| -> u8 { mem.read_u8(base.wrapping_add(off)) };
     let fetch16 = |off: u32| -> u16 { mem.read_u16(base.wrapping_add(off)) };
@@ -808,7 +809,7 @@ fn decode_0f(
     let is32 = operand_size == OperandSize::Dword32;
 
     let modrm = |p: &mut u32| -> (u8, ModrmOperand, u8) {
-        decode_modrm(cpu, mem, base + *p, addr_size)
+        decode_modrm_seg(cpu, mem, base + *p, addr_size, seg_override)
     };
 
     let second = fetch8(*pos);

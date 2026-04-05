@@ -858,6 +858,14 @@ pub fn execute(
                     let new_pe = val & 1;
                     if old_pe == 0 && new_pe == 1 {
                         cpu.mode = crate::regs::CpuMode::ProtectedMode;
+                        // Preserve real-mode segment bases in caches so
+                        // code continues executing from the same physical
+                        // address until a far JMP reloads CS from the GDT.
+                        cpu.cs_cache.base = (cpu.cs as u32) << 4;
+                        cpu.cs_cache.selector = cpu.cs;
+                        cpu.ds_cache.base = (cpu.ds as u32) << 4;
+                        cpu.es_cache.base = (cpu.es as u32) << 4;
+                        cpu.ss_cache.base = (cpu.ss as u32) << 4;
                     } else if old_pe == 1 && new_pe == 0 {
                         cpu.mode = crate::regs::CpuMode::RealMode;
                     }
