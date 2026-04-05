@@ -1,3 +1,43 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperandSize {
+    Word16,
+    Dword32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrSize {
+    Addr16,
+    Addr32,
+}
+
+/// Cached segment descriptor (shadow register)
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentCache {
+    pub selector: u16,
+    pub base: u32,
+    pub limit: u32,
+    pub access: u8,
+    pub flags: u8,
+    pub dpl: u8,
+    pub big: bool,       // D/B bit: 32-bit default
+    pub present: bool,
+}
+
+impl Default for SegmentCache {
+    fn default() -> Self {
+        Self {
+            selector: 0,
+            base: 0,
+            limit: 0xFFFF, // Real mode: 64K limit
+            access: 0x93,  // present, DPL=0, data, writable
+            flags: 0,
+            dpl: 0,
+            big: false,
+            present: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CpuMode {
     #[default]
@@ -50,6 +90,14 @@ pub struct CpuState {
     pub ldtr: u16,
     pub tr: u16,
 
+    // Segment descriptor caches
+    pub cs_cache: SegmentCache,
+    pub ds_cache: SegmentCache,
+    pub es_cache: SegmentCache,
+    pub ss_cache: SegmentCache,
+    pub fs_cache: SegmentCache,
+    pub gs_cache: SegmentCache,
+
     // Mode
     pub mode: CpuMode,
 
@@ -84,6 +132,12 @@ impl Default for CpuState {
             idtr: DescriptorTableReg::default(),
             ldtr: 0,
             tr: 0,
+            cs_cache: SegmentCache::default(),
+            ds_cache: SegmentCache::default(),
+            es_cache: SegmentCache::default(),
+            ss_cache: SegmentCache::default(),
+            fs_cache: SegmentCache::default(),
+            gs_cache: SegmentCache::default(),
             mode: CpuMode::RealMode,
             halted: false,
         }
@@ -157,6 +211,36 @@ impl CpuState {
             5 => self.ebp = (self.ebp & 0xFFFF0000) | val as u32,
             6 => self.esi = (self.esi & 0xFFFF0000) | val as u32,
             7 => self.edi = (self.edi & 0xFFFF0000) | val as u32,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Read 32-bit register by index (EAX=0..EDI=7)
+    pub fn get_reg32(&self, idx: u8) -> u32 {
+        match idx {
+            0 => self.eax,
+            1 => self.ecx,
+            2 => self.edx,
+            3 => self.ebx,
+            4 => self.esp,
+            5 => self.ebp,
+            6 => self.esi,
+            7 => self.edi,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Write 32-bit register by index
+    pub fn set_reg32(&mut self, idx: u8, val: u32) {
+        match idx {
+            0 => self.eax = val,
+            1 => self.ecx = val,
+            2 => self.edx = val,
+            3 => self.ebx = val,
+            4 => self.esp = val,
+            5 => self.ebp = val,
+            6 => self.esi = val,
+            7 => self.edi = val,
             _ => unreachable!(),
         }
     }

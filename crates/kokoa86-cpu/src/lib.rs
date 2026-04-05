@@ -4,4 +4,4 @@ pub mod modrm;
 pub mod decode;
 pub mod execute;
 
-pub use regs::{CpuMode, CpuState};
+pub use regs::{AddrSize, CpuMode, CpuState, OperandSize, SegmentCache};

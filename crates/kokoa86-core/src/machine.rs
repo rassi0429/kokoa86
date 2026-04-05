@@ -93,6 +93,10 @@ impl Machine {
                     log::info!("CPU halted after {} instructions", self.instruction_count);
                     return Ok(());
                 }
+                ExecResult::DivideError => {
+                    log::warn!("Divide error at {:04X}:{:04X}", self.cpu.cs, self.cpu.eip);
+                    // TODO: dispatch #DE exception
+                }
                 ExecResult::UnknownOpcode(byte) => {
                     anyhow::bail!(
                         "Unknown opcode 0x{:02X} at {:04X}:{:04X} after {} instructions",

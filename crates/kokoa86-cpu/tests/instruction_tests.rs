@@ -37,6 +37,7 @@ fn run_code(code: &[u8]) -> (CpuState, MemoryBus) {
             ExecResult::Continue => {}
             ExecResult::Halt => break,
             ExecResult::UnknownOpcode(b) => panic!("Unknown opcode: 0x{:02X}", b),
+            ExecResult::DivideError => panic!("Divide error"),
         }
     }
 
@@ -98,6 +99,7 @@ fn test_mov_mem_to_al() {
             ExecResult::Continue => {}
             ExecResult::Halt => break,
             ExecResult::UnknownOpcode(b) => panic!("0x{:02X}", b),
+            ExecResult::DivideError => panic!("Divide error"),
         }
     }
     assert_eq!(cpu.get_reg8(0), 0x42);

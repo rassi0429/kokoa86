@@ -134,6 +134,10 @@ impl EmulatorApp {
                     self.machine.instruction_count
                 );
             }
+            Ok(ExecResult::DivideError) => {
+                self.running = false;
+                self.error = Some("Divide error (#DE)".to_string());
+            }
             Ok(ExecResult::UnknownOpcode(byte)) => {
                 self.running = false;
                 self.error = Some(format!(

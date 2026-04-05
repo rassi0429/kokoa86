@@ -1,8 +1,8 @@
 use kokoa86_mem::{MemoryAccess, MemoryBus};
-use crate::decode::{AluOp, Instruction, Opcode};
+use crate::decode::*;
 use crate::flags::*;
 use crate::modrm::ModrmOperand;
-use crate::regs::CpuState;
+use crate::regs::{CpuState, OperandSize};
 
 /// Port I/O callback trait
 pub trait PortIo {
@@ -12,19 +12,17 @@ pub trait PortIo {
 
 /// Software interrupt callback trait
 pub trait IntHandler {
-    /// Returns true if the interrupt was handled by a stub
     fn handle_int(&mut self, cpu: &mut CpuState, mem: &mut MemoryBus, vector: u8) -> bool;
 }
 
-/// Execute result
 #[derive(Debug)]
 pub enum ExecResult {
     Continue,
     Halt,
     UnknownOpcode(u8),
+    DivideError,
 }
 
-/// Execute a single decoded instruction
 pub fn execute(
     cpu: &mut CpuState,
     mem: &mut MemoryBus,
@@ -32,172 +30,177 @@ pub fn execute(
     int_handler: &mut dyn IntHandler,
     inst: &Instruction,
 ) -> ExecResult {
-    let next_ip = (cpu.eip as u16).wrapping_add(inst.len as u16);
+    let is32 = inst.operand_size == OperandSize::Dword32;
+    let width: u8 = if is32 { 32 } else { 16 };
+
+    // Compute next IP (after this instruction)
+    let next_ip = if is32 {
+        cpu.eip.wrapping_add(inst.len as u32)
+    } else {
+        (cpu.eip as u16).wrapping_add(inst.len as u16) as u32
+    };
 
     match &inst.op {
         // === MOV register immediate ===
         Opcode::MovReg8Imm(reg, imm) => {
             cpu.set_reg8(*reg, *imm);
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
-        Opcode::MovReg16Imm(reg, imm) => {
-            cpu.set_reg16(*reg, *imm);
-            cpu.eip = next_ip as u32;
+        Opcode::MovRegvImm(reg, imm) => {
+            if is32 { cpu.set_reg32(*reg, *imm); } else { cpu.set_reg16(*reg, *imm as u16); }
+            cpu.eip = next_ip;
         }
 
-        // === MOV with ModR/M (8-bit) ===
-        // 0x88: MOV r/m8, r8  — direction: reg -> r/m
-        // 0x8A: MOV r8, r/m8  — direction: r/m -> reg
-        // We decode both as MovModrm8; need to differentiate by original opcode.
-        // For now, we handle direction based on the original opcode byte.
-        // Since decode stores them the same way, we'll handle via the opcode variants:
-        Opcode::MovModrm8(reg, rm, _bytes) => {
-            // This is used for both 0x88 and 0x8A.
-            // We need to check the original instruction byte to know direction.
-            // Peek at original opcode byte:
+        // === MOV ModR/M 8-bit ===
+        Opcode::MovModrm8(reg, rm, _) => {
             let orig = mem.read_u8(cpu.cs_ip());
             if orig == 0x88 {
-                // MOV r/m8, r8
                 let val = cpu.get_reg8(*reg);
                 write_rm8(cpu, mem, rm, val);
             } else {
-                // MOV r8, r/m8
                 let val = read_rm8(cpu, mem, rm);
                 cpu.set_reg8(*reg, val);
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
-        Opcode::MovModrm16(reg, rm, _bytes) => {
+        Opcode::MovModrmv(reg, rm, _) => {
             let orig = mem.read_u8(cpu.cs_ip());
-            if orig == 0x89 {
-                // MOV r/m16, r16
-                let val = cpu.get_reg16(*reg);
-                write_rm16(cpu, mem, rm, val);
+            if orig == 0x89 || (orig >= 0x26 && orig <= 0x65) {
+                // Direction: reg -> r/m. Also handle prefixed case.
+                // Check if after prefix bytes the opcode is 0x89
+                let actual = find_opcode_byte(cpu, mem, inst);
+                if actual == 0x89 {
+                    if is32 {
+                        let val = cpu.get_reg32(*reg);
+                        write_rm32(cpu, mem, rm, val);
+                    } else {
+                        let val = cpu.get_reg16(*reg);
+                        write_rm16(cpu, mem, rm, val);
+                    }
+                } else {
+                    if is32 {
+                        let val = read_rm32(cpu, mem, rm);
+                        cpu.set_reg32(*reg, val);
+                    } else {
+                        let val = read_rm16(cpu, mem, rm);
+                        cpu.set_reg16(*reg, val);
+                    }
+                }
             } else {
-                // MOV r16, r/m16
-                let val = read_rm16(cpu, mem, rm);
-                cpu.set_reg16(*reg, val);
+                if is32 {
+                    let val = read_rm32(cpu, mem, rm);
+                    cpu.set_reg32(*reg, val);
+                } else {
+                    let val = read_rm16(cpu, mem, rm);
+                    cpu.set_reg16(*reg, val);
+                }
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
 
-        // MOV AL/AX, [addr]
+        Opcode::MovRmImm8(rm, _, imm) => {
+            write_rm8(cpu, mem, rm, *imm);
+            cpu.eip = next_ip;
+        }
+        Opcode::MovRmImmv(rm, _, imm) => {
+            if is32 { write_rm32(cpu, mem, rm, *imm); } else { write_rm16(cpu, mem, rm, *imm as u16); }
+            cpu.eip = next_ip;
+        }
+
         Opcode::MovAlMem(addr) => {
-            let lin = cpu.linear_addr(cpu.ds, *addr);
+            let lin = cpu.linear_addr(cpu.ds, *addr as u16);
             cpu.set_reg8(0, mem.read_u8(lin));
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
         Opcode::MovAxMem(addr) => {
-            let lin = cpu.linear_addr(cpu.ds, *addr);
-            cpu.set_reg16(0, mem.read_u16(lin));
-            cpu.eip = next_ip as u32;
+            let lin = cpu.linear_addr(cpu.ds, *addr as u16);
+            if is32 { cpu.set_reg32(0, mem.read_u32(lin)); } else { cpu.set_reg16(0, mem.read_u16(lin)); }
+            cpu.eip = next_ip;
         }
         Opcode::MovMemAl(addr) => {
-            let lin = cpu.linear_addr(cpu.ds, *addr);
+            let lin = cpu.linear_addr(cpu.ds, *addr as u16);
             mem.write_u8(lin, cpu.get_reg8(0));
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
         Opcode::MovMemAx(addr) => {
-            let lin = cpu.linear_addr(cpu.ds, *addr);
-            mem.write_u16(lin, cpu.get_reg16(0));
-            cpu.eip = next_ip as u32;
+            let lin = cpu.linear_addr(cpu.ds, *addr as u16);
+            if is32 { mem.write_u32(lin, cpu.get_reg32(0)); } else { mem.write_u16(lin, cpu.get_reg16(0)); }
+            cpu.eip = next_ip;
         }
 
-        // MOV Sreg, r/m16
         Opcode::MovSregRm(reg, rm, _) => {
-            let val = read_rm16(cpu, mem, rm);
-            cpu.set_sreg(*reg, val);
-            cpu.eip = next_ip as u32;
+            let val = read_rmv(cpu, mem, rm, false);
+            cpu.set_sreg(*reg, val as u16);
+            cpu.eip = next_ip;
         }
-        // MOV r/m16, Sreg
         Opcode::MovRmSreg(reg, rm, _) => {
             let val = cpu.get_sreg(*reg);
             write_rm16(cpu, mem, rm, val);
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
 
-        // MOV r/m16, imm16
-        Opcode::MovRmImm16(rm, _, imm) => {
-            write_rm16(cpu, mem, rm, *imm);
-            cpu.eip = next_ip as u32;
-        }
-
-        // === ALU operations ===
+        // === ALU ===
         Opcode::AluRmReg8(op, reg, rm, _) => {
-            let a = read_rm8(cpu, mem, rm);
-            let b = cpu.get_reg8(*reg);
-            let result = exec_alu8(cpu, *op, a as u32, b as u32);
-            if *op != AluOp::Cmp {
-                write_rm8(cpu, mem, rm, result as u8);
-            }
-            cpu.eip = next_ip as u32;
+            let a = read_rm8(cpu, mem, rm) as u32;
+            let b = cpu.get_reg8(*reg) as u32;
+            let result = exec_alu(cpu, *op, a, b, 8);
+            if *op != AluOp::Cmp { write_rm8(cpu, mem, rm, result as u8); }
+            cpu.eip = next_ip;
         }
-        Opcode::AluRmReg16(op, reg, rm, _) => {
-            let a = read_rm16(cpu, mem, rm);
-            let b = cpu.get_reg16(*reg);
-            let result = exec_alu16(cpu, *op, a as u32, b as u32);
-            if *op != AluOp::Cmp {
-                write_rm16(cpu, mem, rm, result as u16);
-            }
-            cpu.eip = next_ip as u32;
+        Opcode::AluRmRegv(op, reg, rm, _) => {
+            let a = read_rmv(cpu, mem, rm, is32);
+            let b = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let result = exec_alu(cpu, *op, a, b, width);
+            if *op != AluOp::Cmp { write_rmv(cpu, mem, rm, result, is32); }
+            cpu.eip = next_ip;
         }
         Opcode::AluRegRm8(op, reg, rm, _) => {
-            let a = cpu.get_reg8(*reg);
-            let b = read_rm8(cpu, mem, rm);
-            let result = exec_alu8(cpu, *op, a as u32, b as u32);
-            if *op != AluOp::Cmp {
-                cpu.set_reg8(*reg, result as u8);
-            }
-            cpu.eip = next_ip as u32;
+            let a = cpu.get_reg8(*reg) as u32;
+            let b = read_rm8(cpu, mem, rm) as u32;
+            let result = exec_alu(cpu, *op, a, b, 8);
+            if *op != AluOp::Cmp { cpu.set_reg8(*reg, result as u8); }
+            cpu.eip = next_ip;
         }
-        Opcode::AluRegRm16(op, reg, rm, _) => {
-            let a = cpu.get_reg16(*reg);
-            let b = read_rm16(cpu, mem, rm);
-            let result = exec_alu16(cpu, *op, a as u32, b as u32);
+        Opcode::AluRegRmv(op, reg, rm, _) => {
+            let a = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let b = read_rmv(cpu, mem, rm, is32);
+            let result = exec_alu(cpu, *op, a, b, width);
             if *op != AluOp::Cmp {
-                cpu.set_reg16(*reg, result as u16);
+                if is32 { cpu.set_reg32(*reg, result); } else { cpu.set_reg16(*reg, result as u16); }
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
         Opcode::AluAlImm8(op, imm) => {
-            let a = cpu.get_reg8(0);
-            let result = exec_alu8(cpu, *op, a as u32, *imm as u32);
-            if *op != AluOp::Cmp {
-                cpu.set_reg8(0, result as u8);
-            }
-            cpu.eip = next_ip as u32;
+            let a = cpu.get_reg8(0) as u32;
+            let result = exec_alu(cpu, *op, a, *imm as u32, 8);
+            if *op != AluOp::Cmp { cpu.set_reg8(0, result as u8); }
+            cpu.eip = next_ip;
         }
-        Opcode::AluAxImm16(op, imm) => {
-            let a = cpu.get_reg16(0);
-            let result = exec_alu16(cpu, *op, a as u32, *imm as u32);
+        Opcode::AluAxImmv(op, imm) => {
+            let a = if is32 { cpu.get_reg32(0) } else { cpu.get_reg16(0) as u32 };
+            let result = exec_alu(cpu, *op, a, *imm, width);
             if *op != AluOp::Cmp {
-                cpu.set_reg16(0, result as u16);
+                if is32 { cpu.set_reg32(0, result); } else { cpu.set_reg16(0, result as u16); }
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
         Opcode::AluRmImm8(op, rm, _, imm) => {
-            let a = read_rm8(cpu, mem, rm);
-            let result = exec_alu8(cpu, *op, a as u32, *imm as u32);
-            if *op != AluOp::Cmp {
-                write_rm8(cpu, mem, rm, result as u8);
-            }
-            cpu.eip = next_ip as u32;
+            let a = read_rm8(cpu, mem, rm) as u32;
+            let result = exec_alu(cpu, *op, a, *imm as u32, 8);
+            if *op != AluOp::Cmp { write_rm8(cpu, mem, rm, result as u8); }
+            cpu.eip = next_ip;
         }
-        Opcode::AluRmImm16(op, rm, _, imm) => {
-            let a = read_rm16(cpu, mem, rm);
-            let result = exec_alu16(cpu, *op, a as u32, *imm as u32);
-            if *op != AluOp::Cmp {
-                write_rm16(cpu, mem, rm, result as u16);
-            }
-            cpu.eip = next_ip as u32;
+        Opcode::AluRmImmv(op, rm, _, imm) => {
+            let a = read_rmv(cpu, mem, rm, is32);
+            let result = exec_alu(cpu, *op, a, *imm, width);
+            if *op != AluOp::Cmp { write_rmv(cpu, mem, rm, result, is32); }
+            cpu.eip = next_ip;
         }
-        Opcode::AluRmImm16s8(op, rm, _, imm) => {
-            let a = read_rm16(cpu, mem, rm);
-            let result = exec_alu16(cpu, *op, a as u32, *imm as u32);
-            if *op != AluOp::Cmp {
-                write_rm16(cpu, mem, rm, result as u16);
-            }
-            cpu.eip = next_ip as u32;
+        Opcode::AluRmImmvs8(op, rm, _, imm) => {
+            let a = read_rmv(cpu, mem, rm, is32);
+            let result = exec_alu(cpu, *op, a, *imm, width);
+            if *op != AluOp::Cmp { write_rmv(cpu, mem, rm, result, is32); }
+            cpu.eip = next_ip;
         }
 
         // === TEST ===
@@ -205,401 +208,793 @@ pub fn execute(
             let a = read_rm8(cpu, mem, rm);
             let b = cpu.get_reg8(*reg);
             update_flags_logic(cpu, (a & b) as u32, 8);
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
-        Opcode::TestRmReg16(reg, rm, _) => {
-            let a = read_rm16(cpu, mem, rm);
-            let b = cpu.get_reg16(*reg);
-            update_flags_logic(cpu, (a & b) as u32, 16);
-            cpu.eip = next_ip as u32;
+        Opcode::TestRmRegv(reg, rm, _) => {
+            let a = read_rmv(cpu, mem, rm, is32);
+            let b = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            update_flags_logic(cpu, a & b, width);
+            cpu.eip = next_ip;
         }
         Opcode::TestAlImm8(imm) => {
-            let a = cpu.get_reg8(0);
-            update_flags_logic(cpu, (a & imm) as u32, 8);
-            cpu.eip = next_ip as u32;
+            update_flags_logic(cpu, (cpu.get_reg8(0) & imm) as u32, 8);
+            cpu.eip = next_ip;
         }
-        Opcode::TestAxImm16(imm) => {
-            let a = cpu.get_reg16(0);
-            update_flags_logic(cpu, (a & imm) as u32, 16);
-            cpu.eip = next_ip as u32;
+        Opcode::TestAxImmv(imm) => {
+            let a = if is32 { cpu.get_reg32(0) } else { cpu.get_reg16(0) as u32 };
+            update_flags_logic(cpu, a & imm, width);
+            cpu.eip = next_ip;
         }
 
         // === INC/DEC ===
-        Opcode::IncReg16(reg) => {
-            let val = cpu.get_reg16(*reg);
-            let result = (val as u32).wrapping_add(1);
-            // INC doesn't affect CF
+        Opcode::IncRegv(reg) => {
+            let val = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let result = val.wrapping_add(1);
             let cf = get_flag(cpu, FLAG_CF);
-            update_flags_add(cpu, val as u32, 1, result as u64, 16);
+            update_flags_add(cpu, val, 1, result as u64, width);
             set_flag(cpu, FLAG_CF, cf);
-            cpu.set_reg16(*reg, result as u16);
-            cpu.eip = next_ip as u32;
+            if is32 { cpu.set_reg32(*reg, result); } else { cpu.set_reg16(*reg, result as u16); }
+            cpu.eip = next_ip;
         }
-        Opcode::DecReg16(reg) => {
-            let val = cpu.get_reg16(*reg);
-            let result = (val as u32).wrapping_sub(1);
+        Opcode::DecRegv(reg) => {
+            let val = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let result = val.wrapping_sub(1);
             let cf = get_flag(cpu, FLAG_CF);
-            update_flags_sub(cpu, val as u32, 1, result as u64, 16);
+            update_flags_sub(cpu, val, 1, result as u64, width);
             set_flag(cpu, FLAG_CF, cf);
-            cpu.set_reg16(*reg, result as u16);
-            cpu.eip = next_ip as u32;
+            if is32 { cpu.set_reg32(*reg, result); } else { cpu.set_reg16(*reg, result as u16); }
+            cpu.eip = next_ip;
         }
 
         // === Stack ===
-        Opcode::PushReg16(reg) => {
-            let val = cpu.get_reg16(*reg);
-            push16(cpu, mem, val);
-            cpu.eip = next_ip as u32;
+        Opcode::PushRegv(reg) => {
+            let val = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            pushv(cpu, mem, val, is32);
+            cpu.eip = next_ip;
         }
-        Opcode::PopReg16(reg) => {
-            let val = pop16(cpu, mem);
-            cpu.set_reg16(*reg, val);
-            cpu.eip = next_ip as u32;
+        Opcode::PopRegv(reg) => {
+            let val = popv(cpu, mem, is32);
+            if is32 { cpu.set_reg32(*reg, val); } else { cpu.set_reg16(*reg, val as u16); }
+            cpu.eip = next_ip;
         }
-        Opcode::PushImm16(imm) => {
-            push16(cpu, mem, *imm);
-            cpu.eip = next_ip as u32;
+        Opcode::PushImmv(imm) => {
+            pushv(cpu, mem, *imm, is32);
+            cpu.eip = next_ip;
         }
         Opcode::PushImm8(imm) => {
-            push16(cpu, mem, *imm as i8 as i16 as u16);
-            cpu.eip = next_ip as u32;
+            let val = if is32 { *imm as i8 as i32 as u32 } else { *imm as i8 as i16 as u16 as u32 };
+            pushv(cpu, mem, val, is32);
+            cpu.eip = next_ip;
         }
         Opcode::Pushf => {
-            push16(cpu, mem, cpu.eflags as u16);
-            cpu.eip = next_ip as u32;
+            if is32 { push32(cpu, mem, cpu.eflags); } else { push16(cpu, mem, cpu.eflags as u16); }
+            cpu.eip = next_ip;
         }
         Opcode::Popf => {
-            let val = pop16(cpu, mem);
-            cpu.eflags = (val as u32) | 0x0002; // bit 1 always set
-            cpu.eip = next_ip as u32;
+            let val = if is32 { pop32(cpu, mem) } else { pop16(cpu, mem) as u32 };
+            cpu.eflags = (val & 0x00FCFFFF) | 0x0002;
+            cpu.eip = next_ip;
         }
 
         // === Control flow ===
         Opcode::JmpShort(disp) => {
-            cpu.eip = next_ip.wrapping_add(*disp as i16 as u16) as u32;
+            cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
+            if !is32 { cpu.eip &= 0xFFFF; }
         }
-        Opcode::JmpNear(disp) => {
-            cpu.eip = next_ip.wrapping_add(*disp as u16) as u32;
+        Opcode::JmpNearRel(disp) => {
+            cpu.eip = next_ip.wrapping_add(*disp as u32);
+            if !is32 { cpu.eip &= 0xFFFF; }
+        }
+        Opcode::JmpFar(seg, offset) => {
+            cpu.cs = *seg;
+            cpu.eip = *offset;
         }
         Opcode::Jcc(cc, disp) => {
             if check_condition(cpu, *cc) {
-                cpu.eip = next_ip.wrapping_add(*disp as i16 as u16) as u32;
+                cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
+                if !is32 { cpu.eip &= 0xFFFF; }
             } else {
-                cpu.eip = next_ip as u32;
+                cpu.eip = next_ip;
             }
         }
-        Opcode::CallNear(disp) => {
-            push16(cpu, mem, next_ip);
-            cpu.eip = next_ip.wrapping_add(*disp as u16) as u32;
+        Opcode::JccNear(cc, disp) => {
+            if check_condition(cpu, *cc) {
+                cpu.eip = next_ip.wrapping_add(*disp as u32);
+                if !is32 { cpu.eip &= 0xFFFF; }
+            } else {
+                cpu.eip = next_ip;
+            }
+        }
+        Opcode::CallNearRel(disp) => {
+            pushv(cpu, mem, next_ip, is32);
+            cpu.eip = next_ip.wrapping_add(*disp as u32);
+            if !is32 { cpu.eip &= 0xFFFF; }
+        }
+        Opcode::CallFar(seg, offset) => {
+            pushv(cpu, mem, cpu.cs as u32, is32);
+            pushv(cpu, mem, next_ip, is32);
+            cpu.cs = *seg;
+            cpu.eip = *offset;
         }
         Opcode::Ret => {
-            let ip = pop16(cpu, mem);
-            cpu.eip = ip as u32;
+            let ip = popv(cpu, mem, is32);
+            cpu.eip = ip;
         }
         Opcode::RetImm16(imm) => {
-            let ip = pop16(cpu, mem);
-            cpu.eip = ip as u32;
-            let sp = cpu.get_reg16(4).wrapping_add(*imm);
-            cpu.set_reg16(4, sp);
+            let ip = popv(cpu, mem, is32);
+            cpu.eip = ip;
+            let sp = cpu.esp.wrapping_add(*imm as u32);
+            cpu.esp = if is32 { sp } else { (cpu.esp & 0xFFFF0000) | (sp & 0xFFFF) };
+        }
+        Opcode::Retf => {
+            let ip = popv(cpu, mem, is32);
+            let cs = popv(cpu, mem, is32);
+            cpu.eip = ip;
+            cpu.cs = cs as u16;
+        }
+        Opcode::RetfImm16(imm) => {
+            let ip = popv(cpu, mem, is32);
+            let cs = popv(cpu, mem, is32);
+            cpu.eip = ip;
+            cpu.cs = cs as u16;
+            let sp = cpu.esp.wrapping_add(*imm as u32);
+            cpu.esp = if is32 { sp } else { (cpu.esp & 0xFFFF0000) | (sp & 0xFFFF) };
         }
 
         // === LOOP ===
         Opcode::Loop(disp) => {
-            let cx = cpu.get_reg16(1).wrapping_sub(1); // CX--
+            let cx = cpu.get_reg16(1).wrapping_sub(1);
             cpu.set_reg16(1, cx);
             if cx != 0 {
-                cpu.eip = next_ip.wrapping_add(*disp as i16 as u16) as u32;
-            } else {
-                cpu.eip = next_ip as u32;
-            }
+                cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
+                if !is32 { cpu.eip &= 0xFFFF; }
+            } else { cpu.eip = next_ip; }
         }
         Opcode::Loope(disp) => {
             let cx = cpu.get_reg16(1).wrapping_sub(1);
             cpu.set_reg16(1, cx);
             if cx != 0 && get_flag(cpu, FLAG_ZF) {
-                cpu.eip = next_ip.wrapping_add(*disp as i16 as u16) as u32;
-            } else {
-                cpu.eip = next_ip as u32;
-            }
+                cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
+                if !is32 { cpu.eip &= 0xFFFF; }
+            } else { cpu.eip = next_ip; }
         }
         Opcode::Loopne(disp) => {
             let cx = cpu.get_reg16(1).wrapping_sub(1);
             cpu.set_reg16(1, cx);
             if cx != 0 && !get_flag(cpu, FLAG_ZF) {
-                cpu.eip = next_ip.wrapping_add(*disp as i16 as u16) as u32;
-            } else {
-                cpu.eip = next_ip as u32;
-            }
+                cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
+                if !is32 { cpu.eip &= 0xFFFF; }
+            } else { cpu.eip = next_ip; }
         }
 
         // === Interrupts ===
         Opcode::Int(vec) => {
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
             if !int_handler.handle_int(cpu, mem, *vec) {
-                // Real interrupt dispatch via IVT (Phase 2)
                 log::warn!("Unhandled INT 0x{:02X}", vec);
             }
         }
         Opcode::Iret => {
-            let ip = pop16(cpu, mem);
-            let cs = pop16(cpu, mem);
-            let flags = pop16(cpu, mem);
-            cpu.eip = ip as u32;
-            cpu.cs = cs;
-            cpu.eflags = (flags as u32) | 0x0002;
+            if is32 {
+                let ip = pop32(cpu, mem);
+                let cs = pop32(cpu, mem);
+                let flags = pop32(cpu, mem);
+                cpu.eip = ip;
+                cpu.cs = cs as u16;
+                cpu.eflags = (flags & 0x00FCFFFF) | 0x0002;
+            } else {
+                let ip = pop16(cpu, mem);
+                let cs = pop16(cpu, mem);
+                let flags = pop16(cpu, mem);
+                cpu.eip = ip as u32;
+                cpu.cs = cs;
+                cpu.eflags = (flags as u32) | 0x0002;
+            }
         }
 
         // === I/O ===
         Opcode::InAlImm8(port) => {
-            let val = ports.port_in(*port as u16, 1);
-            cpu.set_reg8(0, val as u8);
-            cpu.eip = next_ip as u32;
+            cpu.set_reg8(0, ports.port_in(*port as u16, 1) as u8);
+            cpu.eip = next_ip;
         }
         Opcode::InAxImm8(port) => {
-            let val = ports.port_in(*port as u16, 2);
-            cpu.set_reg16(0, val as u16);
-            cpu.eip = next_ip as u32;
+            let v = ports.port_in(*port as u16, if is32 { 4 } else { 2 });
+            if is32 { cpu.set_reg32(0, v); } else { cpu.set_reg16(0, v as u16); }
+            cpu.eip = next_ip;
         }
         Opcode::InAlDx => {
-            let port = cpu.get_reg16(2); // DX
-            let val = ports.port_in(port, 1);
-            cpu.set_reg8(0, val as u8);
-            cpu.eip = next_ip as u32;
+            cpu.set_reg8(0, ports.port_in(cpu.get_reg16(2), 1) as u8);
+            cpu.eip = next_ip;
         }
         Opcode::InAxDx => {
-            let port = cpu.get_reg16(2);
-            let val = ports.port_in(port, 2);
-            cpu.set_reg16(0, val as u16);
-            cpu.eip = next_ip as u32;
+            let v = ports.port_in(cpu.get_reg16(2), if is32 { 4 } else { 2 });
+            if is32 { cpu.set_reg32(0, v); } else { cpu.set_reg16(0, v as u16); }
+            cpu.eip = next_ip;
         }
         Opcode::OutImm8Al(port) => {
-            let val = cpu.get_reg8(0);
-            ports.port_out(*port as u16, 1, val as u32);
-            cpu.eip = next_ip as u32;
+            ports.port_out(*port as u16, 1, cpu.get_reg8(0) as u32);
+            cpu.eip = next_ip;
         }
         Opcode::OutImm8Ax(port) => {
-            let val = cpu.get_reg16(0);
-            ports.port_out(*port as u16, 2, val as u32);
-            cpu.eip = next_ip as u32;
+            let v = if is32 { cpu.get_reg32(0) } else { cpu.get_reg16(0) as u32 };
+            ports.port_out(*port as u16, if is32 { 4 } else { 2 }, v);
+            cpu.eip = next_ip;
         }
         Opcode::OutDxAl => {
-            let port = cpu.get_reg16(2);
-            let val = cpu.get_reg8(0);
-            ports.port_out(port, 1, val as u32);
-            cpu.eip = next_ip as u32;
+            ports.port_out(cpu.get_reg16(2), 1, cpu.get_reg8(0) as u32);
+            cpu.eip = next_ip;
         }
         Opcode::OutDxAx => {
-            let port = cpu.get_reg16(2);
-            let val = cpu.get_reg16(0);
-            ports.port_out(port, 2, val as u32);
-            cpu.eip = next_ip as u32;
+            let v = if is32 { cpu.get_reg32(0) } else { cpu.get_reg16(0) as u32 };
+            ports.port_out(cpu.get_reg16(2), if is32 { 4 } else { 2 }, v);
+            cpu.eip = next_ip;
         }
 
         // === LEA ===
-        Opcode::Lea16(reg, rm, _) => {
-            match rm {
-                ModrmOperand::Mem(addr) => {
-                    // LEA stores the offset, not the linear address
-                    cpu.set_reg16(*reg, *addr as u16);
-                }
-                ModrmOperand::Reg(_) => {
-                    // LEA with register is undefined, but typically treated as NOP
-                }
+        Opcode::Leav(reg, rm, _) => {
+            if let ModrmOperand::Mem(addr) = rm {
+                if is32 { cpu.set_reg32(*reg, *addr); } else { cpu.set_reg16(*reg, *addr as u16); }
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
 
         // === XCHG ===
         Opcode::XchgAxReg(reg) => {
-            let ax = cpu.get_reg16(0);
-            let other = cpu.get_reg16(*reg);
-            cpu.set_reg16(0, other);
-            cpu.set_reg16(*reg, ax);
-            cpu.eip = next_ip as u32;
+            if is32 {
+                let a = cpu.get_reg32(0); let b = cpu.get_reg32(*reg);
+                cpu.set_reg32(0, b); cpu.set_reg32(*reg, a);
+            } else {
+                let a = cpu.get_reg16(0); let b = cpu.get_reg16(*reg);
+                cpu.set_reg16(0, b); cpu.set_reg16(*reg, a);
+            }
+            cpu.eip = next_ip;
+        }
+        Opcode::XchgRmReg8(reg, rm, _) => {
+            let a = read_rm8(cpu, mem, rm);
+            let b = cpu.get_reg8(*reg);
+            write_rm8(cpu, mem, rm, b);
+            cpu.set_reg8(*reg, a);
+            cpu.eip = next_ip;
+        }
+        Opcode::XchgRmRegv(reg, rm, _) => {
+            let a = read_rmv(cpu, mem, rm, is32);
+            let b = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            write_rmv(cpu, mem, rm, b, is32);
+            if is32 { cpu.set_reg32(*reg, a); } else { cpu.set_reg16(*reg, a as u16); }
+            cpu.eip = next_ip;
         }
 
         // === CBW/CWD ===
         Opcode::Cbw => {
-            let al = cpu.get_reg8(0) as i8 as i16 as u16;
-            cpu.set_reg16(0, al);
-            cpu.eip = next_ip as u32;
+            if is32 {
+                // CWDE: sign-extend AX to EAX
+                cpu.eax = cpu.get_reg16(0) as i16 as i32 as u32;
+            } else {
+                // CBW: sign-extend AL to AX
+                let al = cpu.get_reg8(0) as i8 as i16 as u16;
+                cpu.set_reg16(0, al);
+            }
+            cpu.eip = next_ip;
         }
         Opcode::Cwd => {
-            let ax = cpu.get_reg16(0) as i16;
-            if ax < 0 {
-                cpu.set_reg16(2, 0xFFFF); // DX
+            if is32 {
+                // CDQ: sign-extend EAX to EDX:EAX
+                if (cpu.eax as i32) < 0 { cpu.edx = 0xFFFFFFFF; } else { cpu.edx = 0; }
             } else {
-                cpu.set_reg16(2, 0x0000);
+                let ax = cpu.get_reg16(0) as i16;
+                if ax < 0 { cpu.set_reg16(2, 0xFFFF); } else { cpu.set_reg16(2, 0); }
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
+        }
+
+        // === SAHF/LAHF ===
+        Opcode::Sahf => {
+            let ah = cpu.get_reg8(4);
+            cpu.eflags = (cpu.eflags & 0xFFFFFF00) | (ah as u32) | 0x02;
+            cpu.eip = next_ip;
+        }
+        Opcode::Lahf => {
+            cpu.set_reg8(4, cpu.eflags as u8);
+            cpu.eip = next_ip;
         }
 
         // === String operations ===
-        Opcode::Movsb => {
-            exec_movsb(cpu, mem);
-            cpu.eip = next_ip as u32;
+        Opcode::Movsb => { exec_movsb(cpu, mem); cpu.eip = next_ip; }
+        Opcode::Movsv => {
+            if is32 { exec_movsd(cpu, mem); } else { exec_movsw(cpu, mem); }
+            cpu.eip = next_ip;
         }
-        Opcode::Movsw => {
-            exec_movsw(cpu, mem);
-            cpu.eip = next_ip as u32;
+        Opcode::Stosb => { exec_stosb(cpu, mem); cpu.eip = next_ip; }
+        Opcode::Stosv => {
+            if is32 { exec_stosd(cpu, mem); } else { exec_stosw(cpu, mem); }
+            cpu.eip = next_ip;
         }
-        Opcode::Stosb => {
-            let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7)); // ES:DI
-            mem.write_u8(addr, cpu.get_reg8(0));
-            if get_flag(cpu, FLAG_DF) {
-                cpu.set_reg16(7, cpu.get_reg16(7).wrapping_sub(1));
-            } else {
-                cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(1));
-            }
-            cpu.eip = next_ip as u32;
+        Opcode::Lodsb => { exec_lodsb(cpu, mem); cpu.eip = next_ip; }
+        Opcode::Lodsv => {
+            if is32 { exec_lodsd(cpu, mem); } else { exec_lodsw(cpu, mem); }
+            cpu.eip = next_ip;
         }
-        Opcode::Stosw => {
-            let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
-            mem.write_u16(addr, cpu.get_reg16(0));
-            if get_flag(cpu, FLAG_DF) {
-                cpu.set_reg16(7, cpu.get_reg16(7).wrapping_sub(2));
-            } else {
-                cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(2));
-            }
-            cpu.eip = next_ip as u32;
-        }
-        Opcode::Lodsb => {
-            let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6)); // DS:SI
-            cpu.set_reg8(0, mem.read_u8(addr));
-            if get_flag(cpu, FLAG_DF) {
-                cpu.set_reg16(6, cpu.get_reg16(6).wrapping_sub(1));
-            } else {
-                cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(1));
-            }
-            cpu.eip = next_ip as u32;
-        }
-        Opcode::Lodsw => {
-            let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
-            cpu.set_reg16(0, mem.read_u16(addr));
-            if get_flag(cpu, FLAG_DF) {
-                cpu.set_reg16(6, cpu.get_reg16(6).wrapping_sub(2));
-            } else {
-                cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(2));
-            }
-            cpu.eip = next_ip as u32;
-        }
+        Opcode::Cmpsb => { exec_cmpsb(cpu, mem); cpu.eip = next_ip; }
+        Opcode::Cmpsv => { exec_cmpsw(cpu, mem); cpu.eip = next_ip; }
+        Opcode::Scasb => { exec_scasb(cpu, mem); cpu.eip = next_ip; }
+        Opcode::Scasv => { exec_scasw(cpu, mem); cpu.eip = next_ip; }
 
         // === REP ===
         Opcode::Rep(inner) => {
-            // REP: repeat while CX != 0
             while cpu.get_reg16(1) != 0 {
-                let tmp_inst = Instruction { op: (**inner).clone(), len: 0 };
-                execute(cpu, mem, ports, int_handler, &tmp_inst);
-                // Don't advance IP from inner (len=0)
+                let tmp = Instruction { op: (**inner).clone(), len: 0, operand_size: inst.operand_size, addr_size: inst.addr_size, segment_override: inst.segment_override };
+                execute(cpu, mem, ports, int_handler, &tmp);
                 let cx = cpu.get_reg16(1).wrapping_sub(1);
                 cpu.set_reg16(1, cx);
+                // For CMPS/SCAS with REPE, stop if ZF=0
+                match **inner {
+                    Opcode::Cmpsb | Opcode::Cmpsv | Opcode::Scasb | Opcode::Scasv => {
+                        if !get_flag(cpu, FLAG_ZF) { break; }
+                    }
+                    _ => {}
+                }
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
         }
         Opcode::Repne(inner) => {
             while cpu.get_reg16(1) != 0 {
-                let tmp_inst = Instruction { op: (**inner).clone(), len: 0 };
-                execute(cpu, mem, ports, int_handler, &tmp_inst);
+                let tmp = Instruction { op: (**inner).clone(), len: 0, operand_size: inst.operand_size, addr_size: inst.addr_size, segment_override: inst.segment_override };
+                execute(cpu, mem, ports, int_handler, &tmp);
                 let cx = cpu.get_reg16(1).wrapping_sub(1);
                 cpu.set_reg16(1, cx);
-                if get_flag(cpu, FLAG_ZF) {
-                    break;
+                match **inner {
+                    Opcode::Cmpsb | Opcode::Cmpsv | Opcode::Scasb | Opcode::Scasv => {
+                        if get_flag(cpu, FLAG_ZF) { break; }
+                    }
+                    _ => {}
                 }
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
+        }
+
+        // === Shift/Rotate ===
+        Opcode::ShiftRm8(op, rm, _, count) => {
+            let val = read_rm8(cpu, mem, rm) as u32;
+            let cnt = resolve_shift_count(cpu, count) & 0x1F;
+            if cnt > 0 {
+                let result = exec_shift(cpu, *op, val, cnt, 8);
+                write_rm8(cpu, mem, rm, result as u8);
+            }
+            cpu.eip = next_ip;
+        }
+        Opcode::ShiftRmv(op, rm, _, count) => {
+            let val = read_rmv(cpu, mem, rm, is32);
+            let cnt = resolve_shift_count(cpu, count) & 0x1F;
+            if cnt > 0 {
+                let result = exec_shift(cpu, *op, val, cnt, width);
+                write_rmv(cpu, mem, rm, result, is32);
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === Group F6 (byte) ===
+        Opcode::GroupF6(sub, rm, _, test_imm) => {
+            match sub {
+                0 | 1 => { // TEST r/m8, imm8
+                    let val = read_rm8(cpu, mem, rm);
+                    update_flags_logic(cpu, (val & test_imm.unwrap()) as u32, 8);
+                }
+                2 => { // NOT r/m8
+                    let val = read_rm8(cpu, mem, rm);
+                    write_rm8(cpu, mem, rm, !val);
+                }
+                3 => { // NEG r/m8
+                    let val = read_rm8(cpu, mem, rm) as u32;
+                    let result = 0u32.wrapping_sub(val);
+                    update_flags_sub(cpu, 0, val, result as u64, 8);
+                    write_rm8(cpu, mem, rm, result as u8);
+                }
+                4 => { // MUL r/m8
+                    let a = cpu.get_reg8(0) as u16;
+                    let b = read_rm8(cpu, mem, rm) as u16;
+                    let result = a * b;
+                    cpu.set_reg16(0, result); // AX = result
+                    let high = (result >> 8) != 0;
+                    set_flag(cpu, FLAG_CF, high);
+                    set_flag(cpu, FLAG_OF, high);
+                }
+                5 => { // IMUL r/m8
+                    let a = cpu.get_reg8(0) as i8 as i16;
+                    let b = read_rm8(cpu, mem, rm) as i8 as i16;
+                    let result = a * b;
+                    cpu.set_reg16(0, result as u16);
+                    let high = result != (result as i8 as i16);
+                    set_flag(cpu, FLAG_CF, high);
+                    set_flag(cpu, FLAG_OF, high);
+                }
+                6 => { // DIV r/m8
+                    let dividend = cpu.get_reg16(0) as u16;
+                    let divisor = read_rm8(cpu, mem, rm) as u16;
+                    if divisor == 0 { cpu.eip = next_ip; return ExecResult::DivideError; }
+                    let quotient = dividend / divisor;
+                    if quotient > 0xFF { cpu.eip = next_ip; return ExecResult::DivideError; }
+                    cpu.set_reg8(0, quotient as u8);      // AL
+                    cpu.set_reg8(4, (dividend % divisor) as u8); // AH
+                }
+                7 => { // IDIV r/m8
+                    let dividend = cpu.get_reg16(0) as i16;
+                    let divisor = read_rm8(cpu, mem, rm) as i8 as i16;
+                    if divisor == 0 { cpu.eip = next_ip; return ExecResult::DivideError; }
+                    let quotient = dividend / divisor;
+                    if quotient > 127 || quotient < -128 { cpu.eip = next_ip; return ExecResult::DivideError; }
+                    cpu.set_reg8(0, quotient as u8);
+                    cpu.set_reg8(4, (dividend % divisor) as u8);
+                }
+                _ => {}
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === Group F7 (word/dword) ===
+        Opcode::GroupF7(sub, rm, _, test_imm) => {
+            match sub {
+                0 | 1 => { // TEST r/mv, immv
+                    let val = read_rmv(cpu, mem, rm, is32);
+                    update_flags_logic(cpu, val & test_imm.unwrap(), width);
+                }
+                2 => { // NOT
+                    let val = read_rmv(cpu, mem, rm, is32);
+                    write_rmv(cpu, mem, rm, !val, is32);
+                }
+                3 => { // NEG
+                    let val = read_rmv(cpu, mem, rm, is32);
+                    let result = 0u64.wrapping_sub(val as u64);
+                    update_flags_sub(cpu, 0, val, result, width);
+                    write_rmv(cpu, mem, rm, result as u32, is32);
+                }
+                4 => { // MUL
+                    if is32 {
+                        let a = cpu.get_reg32(0) as u64;
+                        let b = read_rmv(cpu, mem, rm, true) as u64;
+                        let result = a * b;
+                        cpu.eax = result as u32;
+                        cpu.edx = (result >> 32) as u32;
+                        let high = cpu.edx != 0;
+                        set_flag(cpu, FLAG_CF, high);
+                        set_flag(cpu, FLAG_OF, high);
+                    } else {
+                        let a = cpu.get_reg16(0) as u32;
+                        let b = read_rmv(cpu, mem, rm, false) as u32;
+                        let result = a * b;
+                        cpu.set_reg16(0, result as u16);
+                        cpu.set_reg16(2, (result >> 16) as u16);
+                        let high = (result >> 16) != 0;
+                        set_flag(cpu, FLAG_CF, high);
+                        set_flag(cpu, FLAG_OF, high);
+                    }
+                }
+                5 => { // IMUL
+                    if is32 {
+                        let a = cpu.get_reg32(0) as i32 as i64;
+                        let b = read_rmv(cpu, mem, rm, true) as i32 as i64;
+                        let result = a * b;
+                        cpu.eax = result as u32;
+                        cpu.edx = (result >> 32) as u32;
+                        let high = result != (cpu.eax as i32 as i64);
+                        set_flag(cpu, FLAG_CF, high);
+                        set_flag(cpu, FLAG_OF, high);
+                    } else {
+                        let a = cpu.get_reg16(0) as i16 as i32;
+                        let b = read_rmv(cpu, mem, rm, false) as i16 as i32;
+                        let result = a * b;
+                        cpu.set_reg16(0, result as u16);
+                        cpu.set_reg16(2, (result >> 16) as u16);
+                        let high = result != (result as i16 as i32);
+                        set_flag(cpu, FLAG_CF, high);
+                        set_flag(cpu, FLAG_OF, high);
+                    }
+                }
+                6 => { // DIV
+                    if is32 {
+                        let dividend = ((cpu.edx as u64) << 32) | (cpu.eax as u64);
+                        let divisor = read_rmv(cpu, mem, rm, true) as u64;
+                        if divisor == 0 { cpu.eip = next_ip; return ExecResult::DivideError; }
+                        let quotient = dividend / divisor;
+                        if quotient > 0xFFFFFFFF { cpu.eip = next_ip; return ExecResult::DivideError; }
+                        cpu.eax = quotient as u32;
+                        cpu.edx = (dividend % divisor) as u32;
+                    } else {
+                        let dividend = ((cpu.get_reg16(2) as u32) << 16) | (cpu.get_reg16(0) as u32);
+                        let divisor = read_rmv(cpu, mem, rm, false);
+                        if divisor == 0 { cpu.eip = next_ip; return ExecResult::DivideError; }
+                        let quotient = dividend / divisor;
+                        if quotient > 0xFFFF { cpu.eip = next_ip; return ExecResult::DivideError; }
+                        cpu.set_reg16(0, quotient as u16);
+                        cpu.set_reg16(2, (dividend % divisor) as u16);
+                    }
+                }
+                7 => { // IDIV
+                    if is32 {
+                        let dividend = (((cpu.edx as u64) << 32) | (cpu.eax as u64)) as i64;
+                        let divisor = read_rmv(cpu, mem, rm, true) as i32 as i64;
+                        if divisor == 0 { cpu.eip = next_ip; return ExecResult::DivideError; }
+                        let quotient = dividend / divisor;
+                        if quotient > i32::MAX as i64 || quotient < i32::MIN as i64 {
+                            cpu.eip = next_ip; return ExecResult::DivideError;
+                        }
+                        cpu.eax = quotient as u32;
+                        cpu.edx = (dividend % divisor) as u32;
+                    } else {
+                        let dividend = ((cpu.get_reg16(2) as u32) << 16 | cpu.get_reg16(0) as u32) as i32;
+                        let divisor = read_rmv(cpu, mem, rm, false) as i16 as i32;
+                        if divisor == 0 { cpu.eip = next_ip; return ExecResult::DivideError; }
+                        let quotient = dividend / divisor;
+                        if quotient > i16::MAX as i32 || quotient < i16::MIN as i32 {
+                            cpu.eip = next_ip; return ExecResult::DivideError;
+                        }
+                        cpu.set_reg16(0, quotient as u16);
+                        cpu.set_reg16(2, (dividend % divisor) as u16);
+                    }
+                }
+                _ => {}
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === Group FE (INC/DEC r/m8) ===
+        Opcode::GroupFE(sub, rm, _) => {
+            match sub {
+                0 => {
+                    let val = read_rm8(cpu, mem, rm) as u32;
+                    let result = val.wrapping_add(1);
+                    let cf = get_flag(cpu, FLAG_CF);
+                    update_flags_add(cpu, val, 1, result as u64, 8);
+                    set_flag(cpu, FLAG_CF, cf);
+                    write_rm8(cpu, mem, rm, result as u8);
+                }
+                1 => {
+                    let val = read_rm8(cpu, mem, rm) as u32;
+                    let result = val.wrapping_sub(1);
+                    let cf = get_flag(cpu, FLAG_CF);
+                    update_flags_sub(cpu, val, 1, result as u64, 8);
+                    set_flag(cpu, FLAG_CF, cf);
+                    write_rm8(cpu, mem, rm, result as u8);
+                }
+                _ => log::warn!("Unimplemented FE sub-op: {}", sub),
+            }
+            cpu.eip = next_ip;
         }
 
         // === Group FF ===
         Opcode::GroupFF(sub, rm, _) => {
             match sub {
-                0 => {
-                    // INC r/m16
-                    let val = read_rm16(cpu, mem, rm);
-                    let result = (val as u32).wrapping_add(1);
+                0 => { // INC r/mv
+                    let val = read_rmv(cpu, mem, rm, is32);
+                    let result = val.wrapping_add(1);
                     let cf = get_flag(cpu, FLAG_CF);
-                    update_flags_add(cpu, val as u32, 1, result as u64, 16);
+                    update_flags_add(cpu, val, 1, result as u64, width);
                     set_flag(cpu, FLAG_CF, cf);
-                    write_rm16(cpu, mem, rm, result as u16);
+                    write_rmv(cpu, mem, rm, result, is32);
                 }
-                1 => {
-                    // DEC r/m16
-                    let val = read_rm16(cpu, mem, rm);
-                    let result = (val as u32).wrapping_sub(1);
+                1 => { // DEC r/mv
+                    let val = read_rmv(cpu, mem, rm, is32);
+                    let result = val.wrapping_sub(1);
                     let cf = get_flag(cpu, FLAG_CF);
-                    update_flags_sub(cpu, val as u32, 1, result as u64, 16);
+                    update_flags_sub(cpu, val, 1, result as u64, width);
                     set_flag(cpu, FLAG_CF, cf);
-                    write_rm16(cpu, mem, rm, result as u16);
+                    write_rmv(cpu, mem, rm, result, is32);
                 }
-                2 => {
-                    // CALL r/m16 (near indirect)
-                    let target = read_rm16(cpu, mem, rm);
-                    push16(cpu, mem, next_ip);
-                    cpu.eip = target as u32;
+                2 => { // CALL r/mv (near indirect)
+                    let target = read_rmv(cpu, mem, rm, is32);
+                    pushv(cpu, mem, next_ip, is32);
+                    cpu.eip = target;
                     return ExecResult::Continue;
                 }
-                4 => {
-                    // JMP r/m16 (near indirect)
-                    let target = read_rm16(cpu, mem, rm);
-                    cpu.eip = target as u32;
+                4 => { // JMP r/mv (near indirect)
+                    let target = read_rmv(cpu, mem, rm, is32);
+                    cpu.eip = target;
                     return ExecResult::Continue;
                 }
-                6 => {
-                    // PUSH r/m16
-                    let val = read_rm16(cpu, mem, rm);
-                    push16(cpu, mem, val);
+                6 => { // PUSH r/mv
+                    let val = read_rmv(cpu, mem, rm, is32);
+                    pushv(cpu, mem, val, is32);
                 }
-                _ => {
-                    log::warn!("Unimplemented Group FF sub-opcode: {}", sub);
-                }
+                _ => log::warn!("Unimplemented FF sub-op: {}", sub),
             }
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
+        }
+
+        // === 0x0F two-byte opcodes ===
+        Opcode::Group0F01(sub, rm, _) => {
+            match sub {
+                2 => { // LGDT
+                    if let ModrmOperand::Mem(addr) = rm {
+                        let limit = mem.read_u16(*addr);
+                        let base = if is32 {
+                            mem.read_u32(*addr + 2)
+                        } else {
+                            mem.read_u32(*addr + 2) & 0x00FFFFFF
+                        };
+                        cpu.gdtr = crate::regs::DescriptorTableReg { base, limit };
+                    }
+                }
+                3 => { // LIDT
+                    if let ModrmOperand::Mem(addr) = rm {
+                        let limit = mem.read_u16(*addr);
+                        let base = if is32 {
+                            mem.read_u32(*addr + 2)
+                        } else {
+                            mem.read_u32(*addr + 2) & 0x00FFFFFF
+                        };
+                        cpu.idtr = crate::regs::DescriptorTableReg { base, limit };
+                    }
+                }
+                0 => { // SGDT
+                    if let ModrmOperand::Mem(addr) = rm {
+                        mem.write_u16(*addr, cpu.gdtr.limit);
+                        mem.write_u32(*addr + 2, cpu.gdtr.base);
+                    }
+                }
+                1 => { // SIDT
+                    if let ModrmOperand::Mem(addr) = rm {
+                        mem.write_u16(*addr, cpu.idtr.limit);
+                        mem.write_u32(*addr + 2, cpu.idtr.base);
+                    }
+                }
+                _ => log::warn!("Unimplemented 0F01 sub-op: {}", sub),
+            }
+            cpu.eip = next_ip;
+        }
+
+        Opcode::MovFromCr(cr, reg) => {
+            let val = match cr {
+                0 => cpu.cr0, 2 => cpu.cr2, 3 => cpu.cr3, 4 => cpu.cr4,
+                _ => 0,
+            };
+            cpu.set_reg32(*reg, val);
+            cpu.eip = next_ip;
+        }
+        Opcode::MovToCr(cr, reg) => {
+            let val = cpu.get_reg32(*reg);
+            match cr {
+                0 => {
+                    let old_pe = cpu.cr0 & 1;
+                    cpu.cr0 = val;
+                    let new_pe = val & 1;
+                    if old_pe == 0 && new_pe == 1 {
+                        cpu.mode = crate::regs::CpuMode::ProtectedMode;
+                    } else if old_pe == 1 && new_pe == 0 {
+                        cpu.mode = crate::regs::CpuMode::RealMode;
+                    }
+                }
+                2 => cpu.cr2 = val,
+                3 => cpu.cr3 = val,
+                4 => cpu.cr4 = val,
+                _ => {}
+            }
+            cpu.eip = next_ip;
+        }
+
+        Opcode::MovzxByte(reg, rm, _) => {
+            let val = read_rm8(cpu, mem, rm) as u32;
+            if is32 { cpu.set_reg32(*reg, val); } else { cpu.set_reg16(*reg, val as u16); }
+            cpu.eip = next_ip;
+        }
+        Opcode::MovzxWord(reg, rm, _) => {
+            let val = read_rm16(cpu, mem, rm) as u32;
+            cpu.set_reg32(*reg, val);
+            cpu.eip = next_ip;
+        }
+        Opcode::MovsxByte(reg, rm, _) => {
+            let val = read_rm8(cpu, mem, rm) as i8;
+            if is32 { cpu.set_reg32(*reg, val as i32 as u32); } else { cpu.set_reg16(*reg, val as i16 as u16); }
+            cpu.eip = next_ip;
+        }
+        Opcode::MovsxWord(reg, rm, _) => {
+            let val = read_rm16(cpu, mem, rm) as i16;
+            cpu.set_reg32(*reg, val as i32 as u32);
+            cpu.eip = next_ip;
+        }
+
+        Opcode::Setcc(cc, rm, _) => {
+            let val = if check_condition(cpu, *cc) { 1u8 } else { 0 };
+            write_rm8(cpu, mem, rm, val);
+            cpu.eip = next_ip;
+        }
+
+        Opcode::ImulRegRmv(reg, rm, _) => {
+            if is32 {
+                let a = cpu.get_reg32(*reg) as i32 as i64;
+                let b = read_rmv(cpu, mem, rm, true) as i32 as i64;
+                let result = a * b;
+                cpu.set_reg32(*reg, result as u32);
+                let overflow = result != (result as i32 as i64);
+                set_flag(cpu, FLAG_CF, overflow);
+                set_flag(cpu, FLAG_OF, overflow);
+            } else {
+                let a = cpu.get_reg16(*reg) as i16 as i32;
+                let b = read_rmv(cpu, mem, rm, false) as i16 as i32;
+                let result = a * b;
+                cpu.set_reg16(*reg, result as u16);
+                let overflow = result != (result as i16 as i32);
+                set_flag(cpu, FLAG_CF, overflow);
+                set_flag(cpu, FLAG_OF, overflow);
+            }
+            cpu.eip = next_ip;
+        }
+        Opcode::ImulRegRmvImm8(reg, rm, _, imm) => {
+            if is32 {
+                let b = read_rmv(cpu, mem, rm, true) as i32 as i64;
+                let result = b * (*imm as i64);
+                cpu.set_reg32(*reg, result as u32);
+                set_flag(cpu, FLAG_CF, result != (result as i32 as i64));
+                set_flag(cpu, FLAG_OF, result != (result as i32 as i64));
+            } else {
+                let b = read_rmv(cpu, mem, rm, false) as i16 as i32;
+                let result = b * (*imm as i32);
+                cpu.set_reg16(*reg, result as u16);
+                set_flag(cpu, FLAG_CF, result != (result as i16 as i32));
+                set_flag(cpu, FLAG_OF, result != (result as i16 as i32));
+            }
+            cpu.eip = next_ip;
+        }
+        Opcode::ImulRegRmvImmv(reg, rm, _, imm) => {
+            if is32 {
+                let b = read_rmv(cpu, mem, rm, true) as i32 as i64;
+                let result = b * (*imm as i32 as i64);
+                cpu.set_reg32(*reg, result as u32);
+                set_flag(cpu, FLAG_CF, result != (result as i32 as i64));
+                set_flag(cpu, FLAG_OF, result != (result as i32 as i64));
+            } else {
+                let b = read_rmv(cpu, mem, rm, false) as i16 as i32;
+                let result = b * (*imm as i16 as i32);
+                cpu.set_reg16(*reg, result as u16);
+                set_flag(cpu, FLAG_CF, result != (result as i16 as i32));
+                set_flag(cpu, FLAG_OF, result != (result as i16 as i32));
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === LEAVE ===
+        Opcode::Leave => {
+            if is32 {
+                cpu.esp = cpu.ebp;
+                cpu.ebp = pop32(cpu, mem);
+            } else {
+                cpu.set_reg16(4, cpu.get_reg16(5)); // SP = BP
+                let val = pop16(cpu, mem);
+                cpu.set_reg16(5, val); // BP = pop
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === ENTER ===
+        Opcode::Enter(size, nesting) => {
+            // Simplified: only handle nesting level 0
+            pushv(cpu, mem, cpu.ebp, is32);
+            let frame = cpu.esp;
+            if *nesting == 0 {
+                // Simple case
+            }
+            if is32 {
+                cpu.ebp = frame;
+                cpu.esp = frame.wrapping_sub(*size as u32);
+            } else {
+                cpu.set_reg16(5, frame as u16);
+                cpu.set_reg16(4, (frame as u16).wrapping_sub(*size));
+            }
+            cpu.eip = next_ip;
         }
 
         // === Misc ===
-        Opcode::Nop => {
-            cpu.eip = next_ip as u32;
-        }
+        Opcode::Nop => { cpu.eip = next_ip; }
         Opcode::Hlt => {
             cpu.halted = true;
-            cpu.eip = next_ip as u32;
+            cpu.eip = next_ip;
             return ExecResult::Halt;
         }
-        Opcode::Cli => {
-            set_flag(cpu, FLAG_IF, false);
-            cpu.eip = next_ip as u32;
-        }
-        Opcode::Sti => {
-            set_flag(cpu, FLAG_IF, true);
-            cpu.eip = next_ip as u32;
-        }
-        Opcode::Cld => {
-            set_flag(cpu, FLAG_DF, false);
-            cpu.eip = next_ip as u32;
-        }
-        Opcode::Std => {
-            set_flag(cpu, FLAG_DF, true);
-            cpu.eip = next_ip as u32;
-        }
-        Opcode::Clc => {
-            set_flag(cpu, FLAG_CF, false);
-            cpu.eip = next_ip as u32;
-        }
-        Opcode::Stc => {
-            set_flag(cpu, FLAG_CF, true);
-            cpu.eip = next_ip as u32;
-        }
-        Opcode::Cmc => {
-            let cf = get_flag(cpu, FLAG_CF);
-            set_flag(cpu, FLAG_CF, !cf);
-            cpu.eip = next_ip as u32;
-        }
-
-        // Unused decode variants that shouldn't reach here
-        Opcode::MovRegRm8 | Opcode::MovRegRm16 |
-        Opcode::MovRmReg8 | Opcode::MovRmReg16 |
-        Opcode::MovRmImm8 => {
-            cpu.eip = next_ip as u32;
-        }
+        Opcode::Cli => { set_flag(cpu, FLAG_IF, false); cpu.eip = next_ip; }
+        Opcode::Sti => { set_flag(cpu, FLAG_IF, true); cpu.eip = next_ip; }
+        Opcode::Cld => { set_flag(cpu, FLAG_DF, false); cpu.eip = next_ip; }
+        Opcode::Std => { set_flag(cpu, FLAG_DF, true); cpu.eip = next_ip; }
+        Opcode::Clc => { set_flag(cpu, FLAG_CF, false); cpu.eip = next_ip; }
+        Opcode::Stc => { set_flag(cpu, FLAG_CF, true); cpu.eip = next_ip; }
+        Opcode::Cmc => { let cf = get_flag(cpu, FLAG_CF); set_flag(cpu, FLAG_CF, !cf); cpu.eip = next_ip; }
 
         Opcode::Unknown(byte) => {
             log::error!("Unknown opcode: 0x{:02X} at {:04X}:{:04X}", byte, cpu.cs, cpu.eip);
@@ -610,7 +1005,22 @@ pub fn execute(
     ExecResult::Continue
 }
 
-// === Helper functions ===
+// ============================================================
+// Helper functions
+// ============================================================
+
+/// Find the actual opcode byte (skipping prefixes) for direction detection
+fn find_opcode_byte(cpu: &CpuState, mem: &MemoryBus, inst: &Instruction) -> u8 {
+    let base = cpu.cs_ip();
+    for i in 0..inst.len as u32 {
+        let b = mem.read_u8(base + i);
+        match b {
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 => continue,
+            _ => return b,
+        }
+    }
+    0
+}
 
 fn read_rm8(cpu: &CpuState, mem: &MemoryBus, rm: &ModrmOperand) -> u8 {
     match rm {
@@ -626,18 +1036,31 @@ fn read_rm16(cpu: &CpuState, mem: &MemoryBus, rm: &ModrmOperand) -> u16 {
     }
 }
 
-fn write_rm8(cpu: &mut CpuState, mem: &mut MemoryBus, rm: &ModrmOperand, val: u8) {
+fn read_rm32(cpu: &CpuState, mem: &MemoryBus, rm: &ModrmOperand) -> u32 {
     match rm {
-        ModrmOperand::Reg(idx) => cpu.set_reg8(*idx, val),
-        ModrmOperand::Mem(addr) => mem.write_u8(*addr, val),
+        ModrmOperand::Reg(idx) => cpu.get_reg32(*idx),
+        ModrmOperand::Mem(addr) => mem.read_u32(*addr),
     }
 }
 
+fn read_rmv(cpu: &CpuState, mem: &MemoryBus, rm: &ModrmOperand, is32: bool) -> u32 {
+    if is32 { read_rm32(cpu, mem, rm) } else { read_rm16(cpu, mem, rm) as u32 }
+}
+
+fn write_rm8(cpu: &mut CpuState, mem: &mut MemoryBus, rm: &ModrmOperand, val: u8) {
+    match rm { ModrmOperand::Reg(idx) => cpu.set_reg8(*idx, val), ModrmOperand::Mem(addr) => mem.write_u8(*addr, val) }
+}
+
 fn write_rm16(cpu: &mut CpuState, mem: &mut MemoryBus, rm: &ModrmOperand, val: u16) {
-    match rm {
-        ModrmOperand::Reg(idx) => cpu.set_reg16(*idx, val),
-        ModrmOperand::Mem(addr) => mem.write_u16(*addr, val),
-    }
+    match rm { ModrmOperand::Reg(idx) => cpu.set_reg16(*idx, val), ModrmOperand::Mem(addr) => mem.write_u16(*addr, val) }
+}
+
+fn write_rm32(cpu: &mut CpuState, mem: &mut MemoryBus, rm: &ModrmOperand, val: u32) {
+    match rm { ModrmOperand::Reg(idx) => cpu.set_reg32(*idx, val), ModrmOperand::Mem(addr) => mem.write_u32(*addr, val) }
+}
+
+fn write_rmv(cpu: &mut CpuState, mem: &mut MemoryBus, rm: &ModrmOperand, val: u32, is32: bool) {
+    if is32 { write_rm32(cpu, mem, rm, val); } else { write_rm16(cpu, mem, rm, val as u16); }
 }
 
 fn push16(cpu: &mut CpuState, mem: &mut MemoryBus, val: u16) {
@@ -655,116 +1078,297 @@ fn pop16(cpu: &mut CpuState, mem: &mut MemoryBus) -> u16 {
     val
 }
 
-fn exec_alu8(cpu: &mut CpuState, op: AluOp, a: u32, b: u32) -> u32 {
-    let result = match op {
-        AluOp::Add => {
-            let r = (a as u64).wrapping_add(b as u64);
-            update_flags_add(cpu, a, b, r, 8);
-            r as u32
-        }
-        AluOp::Or => {
-            let r = a | b;
-            update_flags_logic(cpu, r, 8);
-            r
-        }
-        AluOp::Adc => {
-            let carry = if get_flag(cpu, FLAG_CF) { 1u64 } else { 0 };
-            let r = (a as u64).wrapping_add(b as u64).wrapping_add(carry);
-            update_flags_add(cpu, a, b.wrapping_add(carry as u32), r, 8);
-            r as u32
-        }
-        AluOp::Sbb => {
-            let borrow = if get_flag(cpu, FLAG_CF) { 1u64 } else { 0 };
-            let r = (a as u64).wrapping_sub(b as u64).wrapping_sub(borrow);
-            update_flags_sub(cpu, a, b.wrapping_add(borrow as u32), r, 8);
-            r as u32
-        }
-        AluOp::And => {
-            let r = a & b;
-            update_flags_logic(cpu, r, 8);
-            r
-        }
-        AluOp::Sub | AluOp::Cmp => {
-            let r = (a as u64).wrapping_sub(b as u64);
-            update_flags_sub(cpu, a, b, r, 8);
-            r as u32
-        }
-        AluOp::Xor => {
-            let r = a ^ b;
-            update_flags_logic(cpu, r, 8);
-            r
-        }
-    };
-    result & 0xFF
+fn push32(cpu: &mut CpuState, mem: &mut MemoryBus, val: u32) {
+    cpu.esp = cpu.esp.wrapping_sub(4);
+    let addr = cpu.linear_addr(cpu.ss, cpu.esp as u16);
+    mem.write_u32(addr, val);
 }
 
-fn exec_alu16(cpu: &mut CpuState, op: AluOp, a: u32, b: u32) -> u32 {
+fn pop32(cpu: &mut CpuState, mem: &mut MemoryBus) -> u32 {
+    let addr = cpu.linear_addr(cpu.ss, cpu.esp as u16);
+    let val = mem.read_u32(addr);
+    cpu.esp = cpu.esp.wrapping_add(4);
+    val
+}
+
+fn pushv(cpu: &mut CpuState, mem: &mut MemoryBus, val: u32, is32: bool) {
+    if is32 { push32(cpu, mem, val); } else { push16(cpu, mem, val as u16); }
+}
+
+fn popv(cpu: &mut CpuState, mem: &mut MemoryBus, is32: bool) -> u32 {
+    if is32 { pop32(cpu, mem) } else { pop16(cpu, mem) as u32 }
+}
+
+fn exec_alu(cpu: &mut CpuState, op: AluOp, a: u32, b: u32, width: u8) -> u32 {
+    let mask: u64 = match width { 8 => 0xFF, 16 => 0xFFFF, 32 => 0xFFFFFFFF, _ => unreachable!() };
     let result = match op {
         AluOp::Add => {
             let r = (a as u64).wrapping_add(b as u64);
-            update_flags_add(cpu, a, b, r, 16);
-            r as u32
+            update_flags_add(cpu, a, b, r, width);
+            r
         }
         AluOp::Or => {
-            let r = a | b;
-            update_flags_logic(cpu, r, 16);
+            let r = (a | b) as u64;
+            update_flags_logic(cpu, r as u32, width);
             r
         }
         AluOp::Adc => {
             let carry = if get_flag(cpu, FLAG_CF) { 1u64 } else { 0 };
             let r = (a as u64).wrapping_add(b as u64).wrapping_add(carry);
-            update_flags_add(cpu, a, b.wrapping_add(carry as u32), r, 16);
-            r as u32
+            update_flags_add(cpu, a, b.wrapping_add(carry as u32), r, width);
+            r
         }
         AluOp::Sbb => {
             let borrow = if get_flag(cpu, FLAG_CF) { 1u64 } else { 0 };
             let r = (a as u64).wrapping_sub(b as u64).wrapping_sub(borrow);
-            update_flags_sub(cpu, a, b.wrapping_add(borrow as u32), r, 16);
-            r as u32
+            update_flags_sub(cpu, a, b.wrapping_add(borrow as u32), r, width);
+            r
         }
         AluOp::And => {
-            let r = a & b;
-            update_flags_logic(cpu, r, 16);
+            let r = (a & b) as u64;
+            update_flags_logic(cpu, r as u32, width);
             r
         }
         AluOp::Sub | AluOp::Cmp => {
             let r = (a as u64).wrapping_sub(b as u64);
-            update_flags_sub(cpu, a, b, r, 16);
-            r as u32
+            update_flags_sub(cpu, a, b, r, width);
+            r
         }
         AluOp::Xor => {
-            let r = a ^ b;
-            update_flags_logic(cpu, r, 16);
+            let r = (a ^ b) as u64;
+            update_flags_logic(cpu, r as u32, width);
             r
         }
     };
-    result & 0xFFFF
+    (result & mask) as u32
 }
+
+fn resolve_shift_count(cpu: &CpuState, count: &ShiftCount) -> u8 {
+    match count {
+        ShiftCount::One => 1,
+        ShiftCount::CL => cpu.get_reg8(1), // CL
+        ShiftCount::Imm(v) => *v,
+    }
+}
+
+fn exec_shift(cpu: &mut CpuState, op: ShiftOp, val: u32, count: u8, width: u8) -> u32 {
+    let mask: u32 = match width { 8 => 0xFF, 16 => 0xFFFF, 32 => 0xFFFFFFFF, _ => unreachable!() };
+    let cnt = count as u32;
+
+    let result = match op {
+        ShiftOp::Shl | ShiftOp::Sal => {
+            let r = (val << cnt) & mask;
+            let last_out = (val >> (width as u32 - cnt)) & 1;
+            set_flag(cpu, FLAG_CF, last_out != 0);
+            if cnt == 1 {
+                let msb = (r >> (width as u32 - 1)) & 1;
+                set_flag(cpu, FLAG_OF, msb != last_out as u32);
+            }
+            update_flags_logic_preserve_cf(cpu, r, width);
+            r
+        }
+        ShiftOp::Shr => {
+            let last_out = (val >> (cnt - 1)) & 1;
+            let r = (val >> cnt) & mask;
+            set_flag(cpu, FLAG_CF, last_out != 0);
+            if cnt == 1 {
+                set_flag(cpu, FLAG_OF, (val >> (width as u32 - 1)) & 1 != 0);
+            }
+            update_flags_logic_preserve_cf(cpu, r, width);
+            r
+        }
+        ShiftOp::Sar => {
+            let sign_bit = 1u32 << (width as u32 - 1);
+            let mut r = val;
+            for _ in 0..cnt {
+                let last = r & 1;
+                r = (r >> 1) | (r & sign_bit);
+                set_flag(cpu, FLAG_CF, last != 0);
+            }
+            r &= mask;
+            if cnt == 1 { set_flag(cpu, FLAG_OF, false); }
+            update_flags_logic_preserve_cf(cpu, r, width);
+            r
+        }
+        ShiftOp::Rol => {
+            let mut r = val;
+            for _ in 0..cnt {
+                let msb = (r >> (width as u32 - 1)) & 1;
+                r = ((r << 1) | msb) & mask;
+            }
+            set_flag(cpu, FLAG_CF, r & 1 != 0);
+            if cnt == 1 {
+                let msb = (r >> (width as u32 - 1)) & 1;
+                set_flag(cpu, FLAG_OF, msb ^ (r & 1) != 0);
+            }
+            r
+        }
+        ShiftOp::Ror => {
+            let mut r = val;
+            for _ in 0..cnt {
+                let lsb = r & 1;
+                r = (r >> 1) | (lsb << (width as u32 - 1));
+                r &= mask;
+            }
+            set_flag(cpu, FLAG_CF, (r >> (width as u32 - 1)) & 1 != 0);
+            if cnt == 1 {
+                let msb = (r >> (width as u32 - 1)) & 1;
+                let msb1 = (r >> (width as u32 - 2)) & 1;
+                set_flag(cpu, FLAG_OF, msb ^ msb1 != 0);
+            }
+            r
+        }
+        ShiftOp::Rcl => {
+            let mut r = val;
+            for _ in 0..cnt {
+                let cf = if get_flag(cpu, FLAG_CF) { 1u32 } else { 0 };
+                let msb = (r >> (width as u32 - 1)) & 1;
+                r = ((r << 1) | cf) & mask;
+                set_flag(cpu, FLAG_CF, msb != 0);
+            }
+            if cnt == 1 {
+                let msb = (r >> (width as u32 - 1)) & 1;
+                set_flag(cpu, FLAG_OF, msb ^ (if get_flag(cpu, FLAG_CF) { 1 } else { 0 }) != 0);
+            }
+            r
+        }
+        ShiftOp::Rcr => {
+            let mut r = val;
+            for _ in 0..cnt {
+                let cf = if get_flag(cpu, FLAG_CF) { 1u32 } else { 0 };
+                let lsb = r & 1;
+                r = (r >> 1) | (cf << (width as u32 - 1));
+                r &= mask;
+                set_flag(cpu, FLAG_CF, lsb != 0);
+            }
+            if cnt == 1 {
+                let msb = (r >> (width as u32 - 1)) & 1;
+                let msb1 = (r >> (width as u32 - 2)) & 1;
+                set_flag(cpu, FLAG_OF, msb ^ msb1 != 0);
+            }
+            r
+        }
+    };
+    result
+}
+
+fn update_flags_logic_preserve_cf(cpu: &mut CpuState, result: u32, width: u8) {
+    let cf = get_flag(cpu, FLAG_CF);
+    update_flags_logic(cpu, result, width);
+    set_flag(cpu, FLAG_CF, cf);
+}
+
+// === String operations ===
 
 fn exec_movsb(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6)); // DS:SI
-    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7)); // ES:DI
-    let val = mem.read_u8(src);
-    mem.write_u8(dst, val);
-    if get_flag(cpu, FLAG_DF) {
-        cpu.set_reg16(6, cpu.get_reg16(6).wrapping_sub(1));
-        cpu.set_reg16(7, cpu.get_reg16(7).wrapping_sub(1));
-    } else {
-        cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(1));
-        cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(1));
-    }
+    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    mem.write_u8(dst, mem.read_u8(src));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
+    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
 }
 
 fn exec_movsw(cpu: &mut CpuState, mem: &mut MemoryBus) {
     let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
     let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
-    let val = mem.read_u16(src);
-    mem.write_u16(dst, val);
-    if get_flag(cpu, FLAG_DF) {
-        cpu.set_reg16(6, cpu.get_reg16(6).wrapping_sub(2));
-        cpu.set_reg16(7, cpu.get_reg16(7).wrapping_sub(2));
-    } else {
-        cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(2));
-        cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(2));
-    }
+    mem.write_u16(dst, mem.read_u16(src));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
+    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+}
+
+fn exec_movsd(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    mem.write_u32(dst, mem.read_u32(src));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
+    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+}
+
+fn exec_stosb(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    mem.write_u8(addr, cpu.get_reg8(0));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+}
+
+fn exec_stosw(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    mem.write_u16(addr, cpu.get_reg16(0));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+}
+
+fn exec_stosd(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    mem.write_u32(addr, cpu.get_reg32(0));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+}
+
+fn exec_lodsb(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    cpu.set_reg8(0, mem.read_u8(addr));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
+    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+}
+
+fn exec_lodsw(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    cpu.set_reg16(0, mem.read_u16(addr));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
+    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+}
+
+fn exec_lodsd(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    cpu.set_reg32(0, mem.read_u32(addr));
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
+    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+}
+
+fn exec_cmpsb(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let a = mem.read_u8(src) as u32;
+    let b = mem.read_u8(dst) as u32;
+    let r = (a as u64).wrapping_sub(b as u64);
+    update_flags_sub(cpu, a, b, r, 8);
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
+    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+}
+
+fn exec_cmpsw(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let a = mem.read_u16(src) as u32;
+    let b = mem.read_u16(dst) as u32;
+    let r = (a as u64).wrapping_sub(b as u64);
+    update_flags_sub(cpu, a, b, r, 16);
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
+    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+}
+
+fn exec_scasb(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let a = cpu.get_reg8(0) as u32;
+    let b = mem.read_u8(addr) as u32;
+    let r = (a as u64).wrapping_sub(b as u64);
+    update_flags_sub(cpu, a, b, r, 8);
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+}
+
+fn exec_scasw(cpu: &mut CpuState, mem: &mut MemoryBus) {
+    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let a = cpu.get_reg16(0) as u32;
+    let b = mem.read_u16(addr) as u32;
+    let r = (a as u64).wrapping_sub(b as u64);
+    update_flags_sub(cpu, a, b, r, 16);
+    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
+    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
 }

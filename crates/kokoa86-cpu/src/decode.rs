@@ -1,593 +1,847 @@
 use kokoa86_mem::{MemoryAccess, MemoryBus};
 use crate::modrm::{ModrmOperand, decode_modrm16};
-use crate::regs::CpuState;
+use crate::regs::{AddrSize, CpuState, OperandSize};
 
 /// Decoded instruction
 #[derive(Debug, Clone)]
 pub struct Instruction {
     pub op: Opcode,
-    pub len: u8, // instruction length in bytes
+    pub len: u8,
+    pub operand_size: OperandSize,
+    pub addr_size: AddrSize,
+    pub segment_override: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Opcode {
-    // Data movement
-    MovRegRm8,               // 0x8A: MOV r8, r/m8
-    MovRegRm16,              // 0x8B: MOV r16, r/m16
-    MovRmReg8,               // 0x88: MOV r/m8, r8
-    MovRmReg16,              // 0x89: MOV r/m16, r16
-    MovReg8Imm(u8, u8),      // 0xB0-0xB7: MOV r8, imm8
-    MovReg16Imm(u8, u16),    // 0xB8-0xBF: MOV r16, imm16
-    MovRmImm8,               // 0xC6: MOV r/m8, imm8
-    MovRmImm16(ModrmOperand, u8, u16), // 0xC7: MOV r/m16, imm16
-    MovAlMem(u16),           // 0xA0: MOV AL, [addr]
-    MovAxMem(u16),           // 0xA1: MOV AX, [addr]
-    MovMemAl(u16),           // 0xA2: MOV [addr], AL
-    MovMemAx(u16),           // 0xA3: MOV [addr], AX
-    MovSregRm(u8, ModrmOperand, u8),  // 0x8E: MOV Sreg, r/m16
-    MovRmSreg(u8, ModrmOperand, u8),  // 0x8C: MOV r/m16, Sreg
+    // Data movement — "v" = operand-size dependent (16 or 32)
+    MovReg8Imm(u8, u8),         // 0xB0-0xB7: MOV r8, imm8
+    MovRegvImm(u8, u32),        // 0xB8-0xBF: MOV r16/32, imm16/32
+    MovModrm8(u8, ModrmOperand, u8),  // 0x88/0x8A: r8 <-> r/m8 (direction via original opcode)
+    MovModrmv(u8, ModrmOperand, u8),  // 0x89/0x8B: rv <-> r/mv
+    MovRmImm8(ModrmOperand, u8, u8),  // 0xC6: MOV r/m8, imm8
+    MovRmImmv(ModrmOperand, u8, u32), // 0xC7: MOV r/m16/32, imm16/32
+    MovAlMem(u32),              // 0xA0: MOV AL, [addr]
+    MovAxMem(u32),              // 0xA1: MOV AX/EAX, [addr]
+    MovMemAl(u32),              // 0xA2
+    MovMemAx(u32),              // 0xA3
+    MovSregRm(u8, ModrmOperand, u8),  // 0x8E
+    MovRmSreg(u8, ModrmOperand, u8),  // 0x8C
 
-    // ALU: (reg_field, rm_operand, modrm_bytes)
+    // ALU: op, reg, rm, modrm_bytes
     AluRmReg8(AluOp, u8, ModrmOperand, u8),
-    AluRmReg16(AluOp, u8, ModrmOperand, u8),
+    AluRmRegv(AluOp, u8, ModrmOperand, u8),
     AluRegRm8(AluOp, u8, ModrmOperand, u8),
-    AluRegRm16(AluOp, u8, ModrmOperand, u8),
+    AluRegRmv(AluOp, u8, ModrmOperand, u8),
     AluAlImm8(AluOp, u8),
-    AluAxImm16(AluOp, u16),
-    // Group 0x80-0x83
-    AluRmImm8(AluOp, ModrmOperand, u8, u8),     // r/m8, imm8
-    AluRmImm16(AluOp, ModrmOperand, u8, u16),   // r/m16, imm16
-    AluRmImm16s8(AluOp, ModrmOperand, u8, u16), // r/m16, sign-extended imm8
+    AluAxImmv(AluOp, u32),
+    AluRmImm8(AluOp, ModrmOperand, u8, u8),      // 0x80: r/m8, imm8
+    AluRmImmv(AluOp, ModrmOperand, u8, u32),      // 0x81: r/mv, immv
+    AluRmImmvs8(AluOp, ModrmOperand, u8, u32),    // 0x83: r/mv, sign-ext imm8
 
-    // ModR/M data for non-group MOV
-    MovModrm8(u8, ModrmOperand, u8),   // reg, operand, modrm_bytes
-    MovModrm16(u8, ModrmOperand, u8),
+    // TEST
+    TestRmReg8(u8, ModrmOperand, u8),
+    TestRmRegv(u8, ModrmOperand, u8),
+    TestAlImm8(u8),
+    TestAxImmv(u32),
 
     // INC/DEC register
-    IncReg16(u8),   // 0x40-0x47
-    DecReg16(u8),   // 0x48-0x4F
+    IncRegv(u8),    // 0x40-0x47
+    DecRegv(u8),    // 0x48-0x4F
 
     // Stack
-    PushReg16(u8),  // 0x50-0x57
-    PopReg16(u8),   // 0x58-0x5F
-    PushImm16(u16), // 0x68
+    PushRegv(u8),   // 0x50-0x57
+    PopRegv(u8),    // 0x58-0x5F
+    PushImmv(u32),  // 0x68
     PushImm8(u8),   // 0x6A
+    Pushf,          // 0x9C
+    Popf,           // 0x9D
 
     // Control flow
     JmpShort(i8),       // 0xEB
-    JmpNear(i16),       // 0xE9
-    Jcc(u8, i8),        // 0x70-0x7F: condition code, displacement
-    CallNear(i16),      // 0xE8
+    JmpNearRel(i32),    // 0xE9 (16 or 32 bit displacement)
+    JmpFar(u16, u32),   // 0xEA: seg:offset
+    Jcc(u8, i8),        // 0x70-0x7F: short
+    JccNear(u8, i32),   // 0x0F 80-8F: near
+    CallNearRel(i32),   // 0xE8
+    CallFar(u16, u32),  // 0x9A
     Ret,                // 0xC3
     RetImm16(u16),      // 0xC2
+    Retf,               // 0xCB
+    RetfImm16(u16),     // 0xCA
 
     // Interrupts
-    Int(u8),            // 0xCD
-    Iret,               // 0xCF
+    Int(u8),
+    Iret,
 
     // I/O
-    InAlImm8(u8),      // 0xE4
-    InAxImm8(u8),      // 0xE5
-    OutImm8Al(u8),     // 0xE6
-    OutImm8Ax(u8),     // 0xE7
-    InAlDx,            // 0xEC
-    InAxDx,            // 0xED
-    OutDxAl,           // 0xEE
-    OutDxAx,           // 0xEF
+    InAlImm8(u8),
+    InAxImm8(u8),
+    OutImm8Al(u8),
+    OutImm8Ax(u8),
+    InAlDx,
+    InAxDx,
+    OutDxAl,
+    OutDxAx,
 
     // LEA
-    Lea16(u8, ModrmOperand, u8), // 0x8D
+    Leav(u8, ModrmOperand, u8),
 
     // XCHG
-    XchgAxReg(u8),     // 0x90-0x97 (0x90 = NOP)
-
-    // Misc
-    Nop,
-    Hlt,
-    Cli,
-    Sti,
-    Cld,
-    Std,
-    Cmc,
-    Clc,
-    Stc,
+    XchgAxReg(u8),           // 0x91-0x97
+    XchgRmReg8(u8, ModrmOperand, u8),  // 0x86
+    XchgRmRegv(u8, ModrmOperand, u8),  // 0x87
 
     // String operations
-    Movsb,  // 0xA4
-    Movsw,  // 0xA5
-    Stosb,  // 0xAA
-    Stosw,  // 0xAB
-    Lodsb,  // 0xAC
-    Lodsw,  // 0xAD
+    Movsb, Movsv,
+    Stosb, Stosv,
+    Lodsb, Lodsv,
+    Cmpsb, Cmpsv,
+    Scasb, Scasv,
 
-    // REP prefix + string op
+    // REP/REPNE
     Rep(Box<Opcode>),
     Repne(Box<Opcode>),
 
     // LOOP
-    Loop(i8),       // 0xE2
-    Loope(i8),      // 0xE1
-    Loopne(i8),     // 0xE0
+    Loop(i8),
+    Loope(i8),
+    Loopne(i8),
 
-    // CBW/CWD
-    Cbw,  // 0x98
-    Cwd,  // 0x99
+    // CBW/CWD / CWDE/CDQ
+    Cbw,   // 0x98: CBW (16-bit) or CWDE (32-bit)
+    Cwd,   // 0x99: CWD (16-bit) or CDQ (32-bit)
 
-    // TEST
-    TestRmReg8(u8, ModrmOperand, u8),
-    TestRmReg16(u8, ModrmOperand, u8),
-    TestAlImm8(u8),
-    TestAxImm16(u16),
+    // Shift/Rotate: op, rm, modrm_bytes, count
+    ShiftRm8(ShiftOp, ModrmOperand, u8, ShiftCount),
+    ShiftRmv(ShiftOp, ModrmOperand, u8, ShiftCount),
+
+    // Group F6/F7: sub-op, rm, modrm_bytes
+    // F6: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV r/m8
+    GroupF6(u8, ModrmOperand, u8, Option<u8>),  // optional imm for TEST
+    // F7: same for r/mv
+    GroupF7(u8, ModrmOperand, u8, Option<u32>),
 
     // Group FF
-    GroupFF(u8, ModrmOperand, u8), // sub-opcode, operand, modrm_bytes
+    GroupFF(u8, ModrmOperand, u8),
 
-    // PUSHF/POPF
-    Pushf,
-    Popf,
+    // Group FE: INC/DEC r/m8
+    GroupFE(u8, ModrmOperand, u8),
 
-    /// Unimplemented opcode (for graceful error)
+    // 0x0F two-byte opcodes
+    // LGDT/LIDT/SGDT/SIDT
+    Group0F01(u8, ModrmOperand, u8),
+    // MOV r32, CRn / MOV CRn, r32
+    MovFromCr(u8, u8),  // cr, reg
+    MovToCr(u8, u8),
+    // MOVZX/MOVSX
+    MovzxByte(u8, ModrmOperand, u8),  // 0F B6: r16/32 <- r/m8
+    MovzxWord(u8, ModrmOperand, u8),  // 0F B7: r32 <- r/m16
+    MovsxByte(u8, ModrmOperand, u8),  // 0F BE
+    MovsxWord(u8, ModrmOperand, u8),  // 0F BF
+    // SETcc
+    Setcc(u8, ModrmOperand, u8),
+    // IMUL r, r/m (two-operand)
+    ImulRegRmv(u8, ModrmOperand, u8),  // 0F AF
+    // IMUL r, r/m, imm (three-operand)
+    ImulRegRmvImm8(u8, ModrmOperand, u8, i8),   // 0x6B
+    ImulRegRmvImmv(u8, ModrmOperand, u8, u32),   // 0x69
+
+    // SAHF/LAHF
+    Sahf,  // 0x9E
+    Lahf,  // 0x9F
+
+    // Misc
+    Nop,
+    Hlt,
+    Cli, Sti, Cld, Std, Cmc, Clc, Stc,
+
+    // LEAVE
+    Leave,  // 0xC9
+
+    // ENTER
+    Enter(u16, u8), // 0xC8: size, nesting
+
     Unknown(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AluOp {
-    Add = 0,
-    Or = 1,
-    Adc = 2,
-    Sbb = 3,
-    And = 4,
-    Sub = 5,
-    Xor = 6,
-    Cmp = 7,
+    Add = 0, Or = 1, Adc = 2, Sbb = 3,
+    And = 4, Sub = 5, Xor = 6, Cmp = 7,
 }
 
 impl AluOp {
     pub fn from_reg(reg: u8) -> Self {
         match reg {
-            0 => AluOp::Add,
-            1 => AluOp::Or,
-            2 => AluOp::Adc,
-            3 => AluOp::Sbb,
-            4 => AluOp::And,
-            5 => AluOp::Sub,
-            6 => AluOp::Xor,
-            7 => AluOp::Cmp,
+            0 => AluOp::Add, 1 => AluOp::Or, 2 => AluOp::Adc, 3 => AluOp::Sbb,
+            4 => AluOp::And, 5 => AluOp::Sub, 6 => AluOp::Xor, 7 => AluOp::Cmp,
             _ => unreachable!(),
         }
     }
 }
 
-/// Decode an instruction at an arbitrary linear address (for disassembly)
-pub fn decode_at_addr(cpu: &CpuState, mem: &MemoryBus, addr: u32) -> Instruction {
-    let mut pos: u32 = 0;
-    let fetch8 = |off: u32| -> u8 { mem.read_u8(addr.wrapping_add(off)) };
-    let opcode_byte = fetch8(pos);
-
-    if opcode_byte == 0xF3 || opcode_byte == 0xF2 {
-        pos += 1;
-        let inner = decode_at(cpu, mem, addr, &mut pos);
-        let _ = inner.len;
-        let wrapped = if opcode_byte == 0xF3 {
-            Opcode::Rep(Box::new(inner.op))
-        } else {
-            Opcode::Repne(Box::new(inner.op))
-        };
-        return Instruction { op: wrapped, len: pos as u8 };
-    }
-
-    decode_at(cpu, mem, addr, &mut pos)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftOp {
+    Rol = 0, Ror = 1, Rcl = 2, Rcr = 3,
+    Shl = 4, Shr = 5, Sal = 6, Sar = 7,
 }
 
-/// Decode the next instruction at CS:IP
+impl ShiftOp {
+    pub fn from_reg(reg: u8) -> Self {
+        match reg {
+            0 => ShiftOp::Rol, 1 => ShiftOp::Ror, 2 => ShiftOp::Rcl, 3 => ShiftOp::Rcr,
+            4 => ShiftOp::Shl, 5 => ShiftOp::Shr, 6 => ShiftOp::Sal, 7 => ShiftOp::Sar,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ShiftCount {
+    One,
+    CL,
+    Imm(u8),
+}
+
+// ============================================================
+// Decoder
+// ============================================================
+
+/// Decode at arbitrary linear address (for disassembly)
+pub fn decode_at_addr(cpu: &CpuState, mem: &MemoryBus, addr: u32) -> Instruction {
+    decode_impl(cpu, mem, addr)
+}
+
+/// Decode next instruction at CS:IP
 pub fn decode(cpu: &CpuState, mem: &MemoryBus) -> Instruction {
-    let base = cpu.cs_ip();
+    decode_impl(cpu, mem, cpu.cs_ip())
+}
+
+fn decode_impl(cpu: &CpuState, mem: &MemoryBus, base: u32) -> Instruction {
     let mut pos: u32 = 0;
 
     let fetch8 = |off: u32| -> u8 { mem.read_u8(base.wrapping_add(off)) };
-    // Handle REP/REPNE prefix
-    let opcode_byte = fetch8(pos);
 
-    if opcode_byte == 0xF3 || opcode_byte == 0xF2 {
-        pos += 1;
-        let inner = decode_at(cpu, mem, base, &mut pos);
-        let _ = inner.len; // inner.len includes bytes from pos=1 onward
-        let wrapped = if opcode_byte == 0xF3 {
-            Opcode::Rep(Box::new(inner.op))
-        } else {
-            Opcode::Repne(Box::new(inner.op))
-        };
-        // pos already includes the REP prefix byte + inner bytes
-        return Instruction { op: wrapped, len: pos as u8 };
+    // Default sizes from CS descriptor
+    let default_opsize = if cpu.cs_cache.big { OperandSize::Dword32 } else { OperandSize::Word16 };
+    let default_addrsize = if cpu.cs_cache.big { AddrSize::Addr32 } else { AddrSize::Addr16 };
+    let mut operand_size = default_opsize;
+    let mut addr_size = default_addrsize;
+    let mut seg_override: Option<u8> = None;
+
+    // Parse prefix bytes
+    loop {
+        let b = fetch8(pos);
+        match b {
+            0x66 => {
+                operand_size = match operand_size {
+                    OperandSize::Word16 => OperandSize::Dword32,
+                    OperandSize::Dword32 => OperandSize::Word16,
+                };
+                pos += 1;
+            }
+            0x67 => {
+                addr_size = match addr_size {
+                    AddrSize::Addr16 => AddrSize::Addr32,
+                    AddrSize::Addr32 => AddrSize::Addr16,
+                };
+                pos += 1;
+            }
+            0x26 => { seg_override = Some(0); pos += 1; } // ES
+            0x2E => { seg_override = Some(1); pos += 1; } // CS
+            0x36 => { seg_override = Some(2); pos += 1; } // SS
+            0x3E => { seg_override = Some(3); pos += 1; } // DS
+            0x64 => { seg_override = Some(4); pos += 1; } // FS
+            0x65 => { seg_override = Some(5); pos += 1; } // GS
+            0xF0 => { pos += 1; } // LOCK prefix (ignore)
+            0xF3 | 0xF2 => {
+                // REP/REPNE — consume prefix, decode inner instruction
+                pos += 1;
+                let op = decode_opcode(cpu, mem, base, &mut pos, operand_size, addr_size, seg_override);
+                let wrapped = if b == 0xF3 {
+                    Opcode::Rep(Box::new(op))
+                } else {
+                    Opcode::Repne(Box::new(op))
+                };
+                return Instruction {
+                    op: wrapped,
+                    len: pos as u8,
+                    operand_size,
+                    addr_size,
+                    segment_override: seg_override,
+                };
+            }
+            _ => break,
+        }
     }
 
-    decode_at(cpu, mem, base, &mut pos)
+    let op = decode_opcode(cpu, mem, base, &mut pos, operand_size, addr_size, seg_override);
+    Instruction {
+        op,
+        len: pos as u8,
+        operand_size,
+        addr_size,
+        segment_override: seg_override,
+    }
 }
 
-fn decode_at(cpu: &CpuState, mem: &MemoryBus, base: u32, pos: &mut u32) -> Instruction {
+fn decode_opcode(
+    cpu: &CpuState,
+    mem: &MemoryBus,
+    base: u32,
+    pos: &mut u32,
+    operand_size: OperandSize,
+    _addr_size: AddrSize,
+    _seg_override: Option<u8>,
+) -> Opcode {
     let fetch8 = |off: u32| -> u8 { mem.read_u8(base.wrapping_add(off)) };
     let fetch16 = |off: u32| -> u16 { mem.read_u16(base.wrapping_add(off)) };
+    let fetch32 = |off: u32| -> u32 { mem.read_u32(base.wrapping_add(off)) };
+
+    let is32 = operand_size == OperandSize::Dword32;
+
+    // Helper to fetch immediate based on operand size
+    let fetch_immv = |p: &mut u32| -> u32 {
+        if is32 {
+            let v = fetch32(*p);
+            *p += 4;
+            v
+        } else {
+            let v = fetch16(*p) as u32;
+            *p += 2;
+            v
+        }
+    };
+
+    // Helper to sign-extend imm8 to operand size
+    let sign_ext_imm8 = |v: u8| -> u32 {
+        if is32 {
+            v as i8 as i32 as u32
+        } else {
+            (v as i8 as i16 as u16) as u32
+        }
+    };
+
+    let modrm = |p: &mut u32| -> (u8, ModrmOperand, u8) {
+        decode_modrm16(cpu, mem, base + *p)
+    };
 
     let opcode_byte = fetch8(*pos);
     *pos += 1;
 
-    let op = match opcode_byte {
+    match opcode_byte {
         // ALU r/m8, r8
         0x00 | 0x08 | 0x10 | 0x18 | 0x20 | 0x28 | 0x30 | 0x38 => {
             let alu = AluOp::from_reg((opcode_byte >> 3) & 7);
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::AluRmReg8(alu, reg, rm, bytes)
         }
-        // ALU r/m16, r16
+        // ALU r/mv, rv
         0x01 | 0x09 | 0x11 | 0x19 | 0x21 | 0x29 | 0x31 | 0x39 => {
             let alu = AluOp::from_reg((opcode_byte >> 3) & 7);
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            Opcode::AluRmReg16(alu, reg, rm, bytes)
+            Opcode::AluRmRegv(alu, reg, rm, bytes)
         }
         // ALU r8, r/m8
         0x02 | 0x0A | 0x12 | 0x1A | 0x22 | 0x2A | 0x32 | 0x3A => {
             let alu = AluOp::from_reg((opcode_byte >> 3) & 7);
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::AluRegRm8(alu, reg, rm, bytes)
         }
-        // ALU r16, r/m16
+        // ALU rv, r/mv
         0x03 | 0x0B | 0x13 | 0x1B | 0x23 | 0x2B | 0x33 | 0x3B => {
             let alu = AluOp::from_reg((opcode_byte >> 3) & 7);
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            Opcode::AluRegRm16(alu, reg, rm, bytes)
+            Opcode::AluRegRmv(alu, reg, rm, bytes)
         }
         // ALU AL, imm8
         0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C => {
             let alu = AluOp::from_reg((opcode_byte >> 3) & 7);
-            let imm = fetch8(*pos);
-            *pos += 1;
+            let imm = fetch8(*pos); *pos += 1;
             Opcode::AluAlImm8(alu, imm)
         }
-        // ALU AX, imm16
+        // ALU AX/EAX, immv
         0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D => {
             let alu = AluOp::from_reg((opcode_byte >> 3) & 7);
-            let imm = fetch16(*pos);
-            *pos += 2;
-            Opcode::AluAxImm16(alu, imm)
+            let imm = fetch_immv(pos);
+            Opcode::AluAxImmv(alu, imm)
         }
 
-        // INC r16
-        0x40..=0x47 => Opcode::IncReg16(opcode_byte - 0x40),
-        // DEC r16
-        0x48..=0x4F => Opcode::DecReg16(opcode_byte - 0x48),
+        // Segment override prefixes (shouldn't reach here after prefix loop, but handle)
+        0x06 => { // PUSH ES
+            Opcode::PushRegv(0) // handled specially in execute
+        }
+        0x07 => Opcode::PopRegv(0), // POP ES
+        0x0E => Opcode::PushRegv(1), // PUSH CS
+        0x16 => Opcode::PushRegv(2), // PUSH SS
+        0x17 => Opcode::PopRegv(2), // POP SS
+        0x1E => Opcode::PushRegv(3), // PUSH DS
+        0x1F => Opcode::PopRegv(3), // POP DS
 
-        // PUSH r16
-        0x50..=0x57 => Opcode::PushReg16(opcode_byte - 0x50),
-        // POP r16
-        0x58..=0x5F => Opcode::PopReg16(opcode_byte - 0x58),
+        // Two-byte opcodes (0x0F)
+        0x0F => decode_0f(cpu, mem, base, pos, operand_size),
 
-        // PUSH imm16
+        // INC rv
+        0x40..=0x47 => Opcode::IncRegv(opcode_byte - 0x40),
+        // DEC rv
+        0x48..=0x4F => Opcode::DecRegv(opcode_byte - 0x48),
+
+        // PUSH rv
+        0x50..=0x57 => Opcode::PushRegv(opcode_byte - 0x50),
+        // POP rv
+        0x58..=0x5F => Opcode::PopRegv(opcode_byte - 0x58),
+
+        // PUSH immv
         0x68 => {
-            let imm = fetch16(*pos);
-            *pos += 2;
-            Opcode::PushImm16(imm)
+            let imm = fetch_immv(pos);
+            Opcode::PushImmv(imm)
         }
-        // PUSH imm8 (sign-extended)
+        // IMUL r, r/m, immv
+        0x69 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            let imm = fetch_immv(pos);
+            Opcode::ImulRegRmvImmv(reg, rm, bytes, imm)
+        }
+        // PUSH imm8
         0x6A => {
-            let imm = fetch8(*pos);
-            *pos += 1;
+            let imm = fetch8(*pos); *pos += 1;
             Opcode::PushImm8(imm)
+        }
+        // IMUL r, r/m, imm8
+        0x6B => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            let imm = fetch8(*pos) as i8; *pos += 1;
+            Opcode::ImulRegRmvImm8(reg, rm, bytes, imm)
         }
 
         // Jcc short
         0x70..=0x7F => {
             let cc = opcode_byte - 0x70;
-            let disp = fetch8(*pos) as i8;
-            *pos += 1;
+            let disp = fetch8(*pos) as i8; *pos += 1;
             Opcode::Jcc(cc, disp)
         }
 
         // Group 0x80: ALU r/m8, imm8
         0x80 => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            let imm = fetch8(*pos);
-            *pos += 1;
+            let imm = fetch8(*pos); *pos += 1;
             Opcode::AluRmImm8(AluOp::from_reg(reg), rm, bytes, imm)
         }
-        // Group 0x81: ALU r/m16, imm16
+        // Group 0x81: ALU r/mv, immv
         0x81 => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            let imm = fetch16(*pos);
-            *pos += 2;
-            Opcode::AluRmImm16(AluOp::from_reg(reg), rm, bytes, imm)
+            let imm = fetch_immv(pos);
+            Opcode::AluRmImmv(AluOp::from_reg(reg), rm, bytes, imm)
         }
-        // Group 0x83: ALU r/m16, sign-extended imm8
+        // Group 0x83: ALU r/mv, sign-extended imm8
         0x83 => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            let imm = fetch8(*pos) as i8 as i16 as u16;
-            *pos += 1;
-            Opcode::AluRmImm16s8(AluOp::from_reg(reg), rm, bytes, imm)
+            let imm = sign_ext_imm8(fetch8(*pos)); *pos += 1;
+            Opcode::AluRmImmvs8(AluOp::from_reg(reg), rm, bytes, imm)
         }
 
         // TEST r/m8, r8
         0x84 => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::TestRmReg8(reg, rm, bytes)
         }
-        // TEST r/m16, r16
+        // TEST r/mv, rv
         0x85 => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            Opcode::TestRmReg16(reg, rm, bytes)
+            Opcode::TestRmRegv(reg, rm, bytes)
+        }
+        // XCHG r/m8, r8
+        0x86 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::XchgRmReg8(reg, rm, bytes)
+        }
+        // XCHG r/mv, rv
+        0x87 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::XchgRmRegv(reg, rm, bytes)
         }
 
         // MOV r/m8, r8
         0x88 => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::MovModrm8(reg, rm, bytes)
         }
-        // MOV r/m16, r16
+        // MOV r/mv, rv
         0x89 => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            Opcode::MovModrm16(reg, rm, bytes)
+            Opcode::MovModrmv(reg, rm, bytes)
         }
         // MOV r8, r/m8
         0x8A => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::MovModrm8(reg, rm, bytes)
         }
-        // MOV r16, r/m16
+        // MOV rv, r/mv
         0x8B => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            Opcode::MovModrm16(reg, rm, bytes)
+            Opcode::MovModrmv(reg, rm, bytes)
         }
         // MOV r/m16, Sreg
         0x8C => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::MovRmSreg(reg, rm, bytes)
         }
-        // LEA r16, m
+        // LEA
         0x8D => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            Opcode::Lea16(reg, rm, bytes)
+            Opcode::Leav(reg, rm, bytes)
         }
         // MOV Sreg, r/m16
         0x8E => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::MovSregRm(reg, rm, bytes)
         }
 
-        // NOP / XCHG AX, r16
+        // NOP / XCHG AX, rv
         0x90 => Opcode::Nop,
         0x91..=0x97 => Opcode::XchgAxReg(opcode_byte - 0x90),
 
-        // CBW
+        // CBW/CWDE
         0x98 => Opcode::Cbw,
-        // CWD
+        // CWD/CDQ
         0x99 => Opcode::Cwd,
+        // CALL FAR
+        0x9A => {
+            let offset = fetch_immv(pos);
+            let seg = fetch16(*pos); *pos += 2;
+            Opcode::CallFar(seg, offset)
+        }
 
         // PUSHF
         0x9C => Opcode::Pushf,
         // POPF
         0x9D => Opcode::Popf,
+        // SAHF
+        0x9E => Opcode::Sahf,
+        // LAHF
+        0x9F => Opcode::Lahf,
 
         // MOV AL, [addr]
-        0xA0 => {
-            let addr = fetch16(*pos);
-            *pos += 2;
-            Opcode::MovAlMem(addr)
-        }
-        // MOV AX, [addr]
-        0xA1 => {
-            let addr = fetch16(*pos);
-            *pos += 2;
-            Opcode::MovAxMem(addr)
-        }
-        // MOV [addr], AL
-        0xA2 => {
-            let addr = fetch16(*pos);
-            *pos += 2;
-            Opcode::MovMemAl(addr)
-        }
-        // MOV [addr], AX
-        0xA3 => {
-            let addr = fetch16(*pos);
-            *pos += 2;
-            Opcode::MovMemAx(addr)
-        }
+        0xA0 => { let a = fetch_immv(pos); Opcode::MovAlMem(a) }
+        0xA1 => { let a = fetch_immv(pos); Opcode::MovAxMem(a) }
+        0xA2 => { let a = fetch_immv(pos); Opcode::MovMemAl(a) }
+        0xA3 => { let a = fetch_immv(pos); Opcode::MovMemAx(a) }
 
-        // MOVSB/MOVSW
+        // String ops
         0xA4 => Opcode::Movsb,
-        0xA5 => Opcode::Movsw,
-
-        // TEST AL, imm8
-        0xA8 => {
-            let imm = fetch8(*pos);
-            *pos += 1;
-            Opcode::TestAlImm8(imm)
-        }
-        // TEST AX, imm16
-        0xA9 => {
-            let imm = fetch16(*pos);
-            *pos += 2;
-            Opcode::TestAxImm16(imm)
-        }
-
-        // STOSB/STOSW
+        0xA5 => Opcode::Movsv,
+        0xA6 => Opcode::Cmpsb,
+        0xA7 => Opcode::Cmpsv,
+        0xA8 => { let imm = fetch8(*pos); *pos += 1; Opcode::TestAlImm8(imm) }
+        0xA9 => { let imm = fetch_immv(pos); Opcode::TestAxImmv(imm) }
         0xAA => Opcode::Stosb,
-        0xAB => Opcode::Stosw,
-        // LODSB/LODSW
+        0xAB => Opcode::Stosv,
         0xAC => Opcode::Lodsb,
-        0xAD => Opcode::Lodsw,
+        0xAD => Opcode::Lodsv,
+        0xAE => Opcode::Scasb,
+        0xAF => Opcode::Scasv,
 
         // MOV r8, imm8
         0xB0..=0xB7 => {
             let reg = opcode_byte - 0xB0;
-            let imm = fetch8(*pos);
-            *pos += 1;
+            let imm = fetch8(*pos); *pos += 1;
             Opcode::MovReg8Imm(reg, imm)
         }
-        // MOV r16, imm16
+        // MOV rv, immv
         0xB8..=0xBF => {
             let reg = opcode_byte - 0xB8;
-            let imm = fetch16(*pos);
-            *pos += 2;
-            Opcode::MovReg16Imm(reg, imm)
+            let imm = fetch_immv(pos);
+            Opcode::MovRegvImm(reg, imm)
+        }
+
+        // Shift r/m8, imm8
+        0xC0 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            let imm = fetch8(*pos); *pos += 1;
+            Opcode::ShiftRm8(ShiftOp::from_reg(reg), rm, bytes, ShiftCount::Imm(imm))
+        }
+        // Shift r/mv, imm8
+        0xC1 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            let imm = fetch8(*pos); *pos += 1;
+            Opcode::ShiftRmv(ShiftOp::from_reg(reg), rm, bytes, ShiftCount::Imm(imm))
         }
 
         // RET imm16
-        0xC2 => {
-            let imm = fetch16(*pos);
-            *pos += 2;
-            Opcode::RetImm16(imm)
-        }
+        0xC2 => { let imm = fetch16(*pos); *pos += 2; Opcode::RetImm16(imm) }
         // RET
         0xC3 => Opcode::Ret,
 
         // MOV r/m8, imm8
         0xC6 => {
-            let (_reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (_reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            let imm = fetch8(*pos);
-            *pos += 1;
-            Opcode::AluRmImm8(AluOp::Add, rm, bytes, imm) // Reuse — will handle in execute as MOV
+            let imm = fetch8(*pos); *pos += 1;
+            Opcode::MovRmImm8(rm, bytes, imm)
         }
-        // MOV r/m16, imm16
+        // MOV r/mv, immv
         0xC7 => {
-            let (_reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (_reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
-            let imm = fetch16(*pos);
-            *pos += 2;
-            Opcode::MovRmImm16(rm, bytes, imm)
+            let imm = fetch_immv(pos);
+            Opcode::MovRmImmv(rm, bytes, imm)
         }
 
-        // INT imm8
-        0xCD => {
-            let vec = fetch8(*pos);
-            *pos += 1;
-            Opcode::Int(vec)
+        // ENTER
+        0xC8 => {
+            let size = fetch16(*pos); *pos += 2;
+            let nesting = fetch8(*pos); *pos += 1;
+            Opcode::Enter(size, nesting)
         }
+        // LEAVE
+        0xC9 => Opcode::Leave,
+        // RETF imm16
+        0xCA => { let imm = fetch16(*pos); *pos += 2; Opcode::RetfImm16(imm) }
+        // RETF
+        0xCB => Opcode::Retf,
+
+        // INT imm8
+        0xCD => { let v = fetch8(*pos); *pos += 1; Opcode::Int(v) }
         // IRET
         0xCF => Opcode::Iret,
 
-        // LOOPNE
-        0xE0 => {
-            let disp = fetch8(*pos) as i8;
-            *pos += 1;
-            Opcode::Loopne(disp)
+        // Shift r/m8, 1
+        0xD0 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::ShiftRm8(ShiftOp::from_reg(reg), rm, bytes, ShiftCount::One)
         }
-        // LOOPE
-        0xE1 => {
-            let disp = fetch8(*pos) as i8;
-            *pos += 1;
-            Opcode::Loope(disp)
+        // Shift r/mv, 1
+        0xD1 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::ShiftRmv(ShiftOp::from_reg(reg), rm, bytes, ShiftCount::One)
         }
-        // LOOP
-        0xE2 => {
-            let disp = fetch8(*pos) as i8;
-            *pos += 1;
-            Opcode::Loop(disp)
+        // Shift r/m8, CL
+        0xD2 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::ShiftRm8(ShiftOp::from_reg(reg), rm, bytes, ShiftCount::CL)
+        }
+        // Shift r/mv, CL
+        0xD3 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::ShiftRmv(ShiftOp::from_reg(reg), rm, bytes, ShiftCount::CL)
         }
 
+        // LOOPNE
+        0xE0 => { let d = fetch8(*pos) as i8; *pos += 1; Opcode::Loopne(d) }
+        // LOOPE
+        0xE1 => { let d = fetch8(*pos) as i8; *pos += 1; Opcode::Loope(d) }
+        // LOOP
+        0xE2 => { let d = fetch8(*pos) as i8; *pos += 1; Opcode::Loop(d) }
+
         // IN AL, imm8
-        0xE4 => {
-            let port = fetch8(*pos);
-            *pos += 1;
-            Opcode::InAlImm8(port)
-        }
-        // IN AX, imm8
-        0xE5 => {
-            let port = fetch8(*pos);
-            *pos += 1;
-            Opcode::InAxImm8(port)
-        }
-        // OUT imm8, AL
-        0xE6 => {
-            let port = fetch8(*pos);
-            *pos += 1;
-            Opcode::OutImm8Al(port)
-        }
-        // OUT imm8, AX
-        0xE7 => {
-            let port = fetch8(*pos);
-            *pos += 1;
-            Opcode::OutImm8Ax(port)
-        }
+        0xE4 => { let p = fetch8(*pos); *pos += 1; Opcode::InAlImm8(p) }
+        0xE5 => { let p = fetch8(*pos); *pos += 1; Opcode::InAxImm8(p) }
+        0xE6 => { let p = fetch8(*pos); *pos += 1; Opcode::OutImm8Al(p) }
+        0xE7 => { let p = fetch8(*pos); *pos += 1; Opcode::OutImm8Ax(p) }
 
         // CALL near
         0xE8 => {
-            let disp = fetch16(*pos) as i16;
-            *pos += 2;
-            Opcode::CallNear(disp)
+            let disp = if is32 {
+                let d = fetch32(*pos) as i32; *pos += 4; d
+            } else {
+                let d = fetch16(*pos) as i16 as i32; *pos += 2; d
+            };
+            Opcode::CallNearRel(disp)
         }
         // JMP near
         0xE9 => {
-            let disp = fetch16(*pos) as i16;
-            *pos += 2;
-            Opcode::JmpNear(disp)
+            let disp = if is32 {
+                let d = fetch32(*pos) as i32; *pos += 4; d
+            } else {
+                let d = fetch16(*pos) as i16 as i32; *pos += 2; d
+            };
+            Opcode::JmpNearRel(disp)
+        }
+        // JMP far
+        0xEA => {
+            let offset = fetch_immv(pos);
+            let seg = fetch16(*pos); *pos += 2;
+            Opcode::JmpFar(seg, offset)
         }
         // JMP short
-        0xEB => {
-            let disp = fetch8(*pos) as i8;
-            *pos += 1;
-            Opcode::JmpShort(disp)
-        }
+        0xEB => { let d = fetch8(*pos) as i8; *pos += 1; Opcode::JmpShort(d) }
 
-        // IN AL, DX
         0xEC => Opcode::InAlDx,
-        // IN AX, DX
         0xED => Opcode::InAxDx,
-        // OUT DX, AL
         0xEE => Opcode::OutDxAl,
-        // OUT DX, AX
         0xEF => Opcode::OutDxAx,
 
         // HLT
         0xF4 => Opcode::Hlt,
-
         // CMC
         0xF5 => Opcode::Cmc,
 
-        // CLC
+        // Group F6: byte operations
+        0xF6 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            let test_imm = if reg == 0 || reg == 1 {
+                let imm = fetch8(*pos); *pos += 1;
+                Some(imm)
+            } else { None };
+            Opcode::GroupF6(reg, rm, bytes, test_imm)
+        }
+        // Group F7: word/dword operations
+        0xF7 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            let test_imm = if reg == 0 || reg == 1 {
+                let imm = fetch_immv(pos);
+                Some(imm)
+            } else { None };
+            Opcode::GroupF7(reg, rm, bytes, test_imm)
+        }
+
         0xF8 => Opcode::Clc,
-        // STC
         0xF9 => Opcode::Stc,
-        // CLI
         0xFA => Opcode::Cli,
-        // STI
         0xFB => Opcode::Sti,
-        // CLD
         0xFC => Opcode::Cld,
-        // STD
         0xFD => Opcode::Std,
 
-        // Group 0xFF
+        // Group FE: INC/DEC r/m8
+        0xFE => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::GroupFE(reg, rm, bytes)
+        }
+        // Group FF
         0xFF => {
-            let (reg, rm, bytes) = decode_modrm16(cpu, mem, base + *pos);
+            let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::GroupFF(reg, rm, bytes)
         }
 
         _ => Opcode::Unknown(opcode_byte),
-    };
-
-    Instruction { op, len: *pos as u8 }
+    }
 }
 
-/// Special MovRmImm16 that wraps rm + bytes + imm
-#[derive(Debug, Clone)]
-pub struct MovRmImm16Data {
-    pub rm: ModrmOperand,
-    pub modrm_bytes: u8,
-    pub imm: u16,
+/// Decode 0x0F two-byte opcodes
+fn decode_0f(
+    cpu: &CpuState,
+    mem: &MemoryBus,
+    base: u32,
+    pos: &mut u32,
+    operand_size: OperandSize,
+) -> Opcode {
+    let fetch8 = |off: u32| -> u8 { mem.read_u8(base.wrapping_add(off)) };
+    let fetch16 = |off: u32| -> u16 { mem.read_u16(base.wrapping_add(off)) };
+    let fetch32 = |off: u32| -> u32 { mem.read_u32(base.wrapping_add(off)) };
+    let is32 = operand_size == OperandSize::Dword32;
+
+    let modrm = |p: &mut u32| -> (u8, ModrmOperand, u8) {
+        decode_modrm16(cpu, mem, base + *p)
+    };
+
+    let second = fetch8(*pos);
+    *pos += 1;
+
+    match second {
+        // Group 7: SGDT/SIDT/LGDT/LIDT
+        0x01 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Group0F01(reg, rm, bytes)
+        }
+
+        // MOV r32, CRn
+        0x20 => {
+            let modrm_byte = fetch8(*pos); *pos += 1;
+            let cr = (modrm_byte >> 3) & 7;
+            let reg = modrm_byte & 7;
+            Opcode::MovFromCr(cr, reg)
+        }
+        // MOV CRn, r32
+        0x22 => {
+            let modrm_byte = fetch8(*pos); *pos += 1;
+            let cr = (modrm_byte >> 3) & 7;
+            let reg = modrm_byte & 7;
+            Opcode::MovToCr(cr, reg)
+        }
+
+        // Jcc near (16-bit or 32-bit displacement)
+        0x80..=0x8F => {
+            let cc = second - 0x80;
+            let disp = if is32 {
+                let d = fetch32(*pos) as i32; *pos += 4; d
+            } else {
+                let d = fetch16(*pos) as i16 as i32; *pos += 2; d
+            };
+            Opcode::JccNear(cc, disp)
+        }
+
+        // SETcc r/m8
+        0x90..=0x9F => {
+            let cc = second - 0x90;
+            let (_, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Setcc(cc, rm, bytes)
+        }
+
+        // IMUL r, r/m
+        0xAF => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::ImulRegRmv(reg, rm, bytes)
+        }
+
+        // MOVZX r, r/m8
+        0xB6 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::MovzxByte(reg, rm, bytes)
+        }
+        // MOVZX r32, r/m16
+        0xB7 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::MovzxWord(reg, rm, bytes)
+        }
+        // MOVSX r, r/m8
+        0xBE => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::MovsxByte(reg, rm, bytes)
+        }
+        // MOVSX r32, r/m16
+        0xBF => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::MovsxWord(reg, rm, bytes)
+        }
+
+        _ => Opcode::Unknown(second),
+    }
 }
