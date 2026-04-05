@@ -18,7 +18,7 @@ fn diag_seabios_boot() {
     machine.ports.register(Box::new(serial));
     machine.load_bios(bios_data);
 
-    let report = kokoa86_core::diag::trace_boot(&mut machine, 50_000_000, 50);
+    let report = kokoa86_core::diag::trace_boot(&mut machine, 500_000_000, 50);
     println!("{}", report);
 
     // Serial output from SeaBIOS
