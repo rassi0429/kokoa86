@@ -646,11 +646,22 @@ fn decode_opcode(
         // LAHF
         0x9F => Opcode::Lahf,
 
-        // MOV AL, [addr]
-        0xA0 => { let a = fetch_immv(pos); Opcode::MovAlMem(a) }
-        0xA1 => { let a = fetch_immv(pos); Opcode::MovAxMem(a) }
-        0xA2 => { let a = fetch_immv(pos); Opcode::MovMemAl(a) }
-        0xA3 => { let a = fetch_immv(pos); Opcode::MovMemAx(a) }
+        // MOV AL/AX, [moffs] — moffs size is determined by ADDRESS size, not operand size
+        0xA0 | 0xA1 | 0xA2 | 0xA3 => {
+            let addr_32 = _addr_size == AddrSize::Addr32;
+            let a = if addr_32 {
+                let v = fetch32(*pos); *pos += 4; v
+            } else {
+                let v = fetch16(*pos) as u32; *pos += 2; v
+            };
+            match opcode_byte {
+                0xA0 => Opcode::MovAlMem(a),
+                0xA1 => Opcode::MovAxMem(a),
+                0xA2 => Opcode::MovMemAl(a),
+                0xA3 => Opcode::MovMemAx(a),
+                _ => unreachable!(),
+            }
+        }
 
         // String ops
         0xA4 => Opcode::Movsb,
