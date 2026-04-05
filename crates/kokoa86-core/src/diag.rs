@@ -46,7 +46,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
             break;
         }
         // Trace normally
-        if i >= 19610 && i < 19640 {
+        if i >= 25350 && i < 25460 {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();
             let mut bytes = String::new();
@@ -54,9 +54,18 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
                 bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(linear + j)));
             }
             output.push_str(&format!(
-                "TRACE {:5}: {:04X}:{:08X}  {:<30} {:?}\n",
-                i, cs, ip, bytes.trim(), inst.op
+                "TRACE {:5}: {:04X}:{:08X}  {:<30} {:?}  ESP={:08X}\n",
+                i, cs, ip, bytes.trim(), inst.op, machine.cpu.esp
             ));
+            // After instruction 37 (CALL), dump stack
+            if i == 37 {
+                output.push_str("  === Stack after PUSH+PUSH+CALL ===\n");
+                let sp = machine.cpu.esp;
+                for j in 0..6u32 {
+                    output.push_str(&format!("    [{:08X}] = {:08X}\n",
+                        sp + j*4, machine.mem.read_u32(sp + j*4)));
+                }
+            }
         }
 
         // Detect infinite loops

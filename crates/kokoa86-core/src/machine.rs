@@ -21,6 +21,8 @@ pub struct Machine {
     pub pci: PciBus,
     pub bios_stubs: bool,
     pub instruction_count: u64,
+    /// Captured serial output (COM1)
+    pub serial_output: Vec<u8>,
 }
 
 impl Machine {
@@ -40,6 +42,7 @@ impl Machine {
             pci: PciBus::new().with_default_devices(),
             bios_stubs: true,
             instruction_count: 0,
+            serial_output: Vec::new(),
         };
         // Register misc devices on PortBus
         m.ports.register(Box::new(kokoa86_dev::misc::PostPort::new()));
@@ -64,6 +67,12 @@ impl Machine {
         let base = 0x100000u32.saturating_sub(size); // e.g., 0xC0000 for 256KB
         log::info!("Mapping BIOS ROM ({} KB) at 0x{:05X}-0xFFFFF", size / 1024, base);
         self.mem.map_rom(base, data);
+
+        // Set up BIOS Data Area (BDA) at 0x400
+        // COM1 base address at 0x400
+        self.mem.write_u16(0x400, 0x03F8); // COM1
+        // Equipment word at 0x410: has serial ports
+        self.mem.write_u16(0x410, 0x0021); // 1 serial port + VGA 80x25
 
         // Set CPU to BIOS reset vector: CS=0xF000, IP=0xFFF0
         // This is the standard x86 reset vector at physical 0xFFFF0
@@ -137,6 +146,7 @@ impl Machine {
             ata: &mut self.ata,
             cmos: &mut self.cmos,
             pci: &mut self.pci,
+            serial_capture: &mut self.serial_output,
         };
         let mut int_adapter = BiosStubHandler {
             enabled: self.bios_stubs,
@@ -236,6 +246,7 @@ struct DevicePortAdapter<'a> {
     ata: &'a mut AtaDisk,
     cmos: &'a mut Cmos,
     pci: &'a mut PciBus,
+    serial_capture: &'a mut Vec<u8>,
 }
 
 impl PortIo for DevicePortAdapter<'_> {
@@ -245,6 +256,7 @@ impl PortIo for DevicePortAdapter<'_> {
             0xA0..=0xA1 => return self.pic_slave.port_in(port, size),
             0x40..=0x43 => return self.pit.port_in(port, size),
             0x60 | 0x64 => return self.ps2.port_in(port, size),
+            0xE9 => return 0xE9, // QEMU ISA debug port (present)
             0x70..=0x71 => return self.cmos.port_in(port, size),
             0xCF8..=0xCFF => return self.pci.port_in(port, size),
             0x1F0..=0x1F7 | 0x3F6 => return self.ata.port_in(port, size),
@@ -255,6 +267,10 @@ impl PortIo for DevicePortAdapter<'_> {
     }
 
     fn port_out(&mut self, port: u16, size: u8, val: u32) {
+        // Capture serial output (COM1 THR) and QEMU debug port (0xE9)
+        if (port == 0x3F8 || port == 0xE9) && size == 1 {
+            self.serial_capture.push(val as u8);
+        }
         match port {
             0x20..=0x21 => { self.pic_master.port_out(port, size, val); return; }
             0xA0..=0xA1 => { self.pic_slave.port_out(port, size, val); return; }

@@ -1597,16 +1597,25 @@ fn write_rmv(cpu: &mut CpuState, mem: &mut MemoryBus, rm: &ModrmOperand, val: u3
     if is32 { write_rm32(cpu, mem, rm, val); } else { write_rm16(cpu, mem, rm, val as u16); }
 }
 
+/// Compute stack linear address: SS:SP in real mode, ss_cache.base+ESP in protected
+fn stack_addr(cpu: &CpuState, offset: u32) -> u32 {
+    if cpu.mode == crate::regs::CpuMode::ProtectedMode {
+        cpu.ss_cache.base.wrapping_add(offset)
+    } else {
+        ((cpu.ss as u32) << 4).wrapping_add(offset & 0xFFFF)
+    }
+}
+
 fn push16(cpu: &mut CpuState, mem: &mut MemoryBus, val: u16) {
     let sp = cpu.get_reg16(4).wrapping_sub(2);
     cpu.set_reg16(4, sp);
-    let addr = cpu.linear_addr(cpu.ss, sp);
+    let addr = stack_addr(cpu, sp as u32);
     mem.write_u16(addr, val);
 }
 
 fn pop16(cpu: &mut CpuState, mem: &mut MemoryBus) -> u16 {
     let sp = cpu.get_reg16(4);
-    let addr = cpu.linear_addr(cpu.ss, sp);
+    let addr = stack_addr(cpu, sp as u32);
     let val = mem.read_u16(addr);
     cpu.set_reg16(4, sp.wrapping_add(2));
     val
@@ -1614,12 +1623,12 @@ fn pop16(cpu: &mut CpuState, mem: &mut MemoryBus) -> u16 {
 
 fn push32(cpu: &mut CpuState, mem: &mut MemoryBus, val: u32) {
     cpu.esp = cpu.esp.wrapping_sub(4);
-    let addr = cpu.linear_addr(cpu.ss, cpu.esp as u16);
+    let addr = stack_addr(cpu, cpu.esp);
     mem.write_u32(addr, val);
 }
 
 fn pop32(cpu: &mut CpuState, mem: &mut MemoryBus) -> u32 {
-    let addr = cpu.linear_addr(cpu.ss, cpu.esp as u16);
+    let addr = stack_addr(cpu, cpu.esp);
     let val = mem.read_u32(addr);
     cpu.esp = cpu.esp.wrapping_add(4);
     val

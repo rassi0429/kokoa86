@@ -14,17 +14,22 @@ fn diag_seabios_boot() {
     };
 
     let mut machine = Machine::new(16 * 1024 * 1024); // 16MB RAM
-    machine.ports.register(Box::new(Serial8250::new_capture(0x3F8)));
+    let serial = Serial8250::new_capture(0x3F8);
+    machine.ports.register(Box::new(serial));
     machine.load_bios(bios_data);
 
     let report = kokoa86_core::diag::trace_boot(&mut machine, 50_000_000, 50);
     println!("{}", report);
 
-    // Check serial output
-    // The serial device is behind Box<dyn PortDevice>, can't access directly.
-    // Instead, check what was written by reading from machine state.
+    // Serial output from SeaBIOS
+    println!("\n=== Serial Output ({} bytes) ===", machine.serial_output.len());
+    if !machine.serial_output.is_empty() {
+        let s = String::from_utf8_lossy(&machine.serial_output);
+        println!("{}", s);
+    } else {
+        println!("(no serial output)");
+    }
 
-    // Dump some info about the halt location
     println!("\n=== Halt analysis ===");
     let halt_addr = machine.cpu.eip;
     // Check the 50 bytes before halt for string data
@@ -42,6 +47,13 @@ fn diag_seabios_boot() {
     // Check EDX which was the 2nd param
     let edx = machine.cpu.get_reg32(2);
     println!("EDX (2nd param): 0x{:08X}", edx);
+    // Check memory at what should be stack with fmt string
+    println!("mem[0xF6034] (serial debug port): {:08X}", machine.mem.read_u32(0xF6034));
+    println!("mem[0x400] (BDA COM1): {:04X}", machine.mem.read_u16(0x400));
+    println!("mem[0x6FD0] = {:08X}", machine.mem.read_u32(0x6FD0));
+    println!("mem[0x6FCC] = {:08X}", machine.mem.read_u32(0x6FCC));
+    println!("mem[0x6FD4] = {:08X}", machine.mem.read_u32(0x6FD4));
+    println!("mem[0x6FD8] = {:08X}", machine.mem.read_u32(0x6FD8));
 
     // Dump stack (return addresses)
     println!("\nStack dump:");
