@@ -1,211 +1,122 @@
-/// Diagnostic utilities for debugging BIOS boot
 use crate::Machine;
 use kokoa86_cpu::decode;
 use kokoa86_cpu::execute::ExecResult;
 use kokoa86_mem::MemoryAccess;
 
-/// Run the machine for N instructions, printing a trace of the first `trace_count`
-/// and returning a diagnostic summary.
-pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> String {
+pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_first: u64) -> String {
     let mut output = String::new();
-    let mut unknown_opcodes: Vec<(u8, u16, u32)> = Vec::new();
-    let mut last_cs_ip = (0u16, 0u32);
-    let mut loop_count = 0u64;
+    output.push_str(&format!("=== Boot Trace === Start: {:04X}:{:04X}\n\n",
+        machine.cpu.cs, machine.cpu.eip));
 
-    output.push_str(&format!(
-        "=== Boot Trace ===\nStart: {:04X}:{:04X}\n\n",
-        machine.cpu.cs, machine.cpu.eip
-    ));
+    let mut last_serial_len = 0usize;
 
-    let mut last_ips: Vec<(u16, u32)> = Vec::new();
+    // Track loop detection: if IP stays in same 256-byte range for too long
+    let mut loop_range_start: u32 = 0;
+    let mut loop_count: u64 = 0;
+    let mut loop_traced = false;
 
     for i in 0..max_inst {
         let cs = machine.cpu.cs;
         let ip = machine.cpu.eip;
-
-        // Track last 20 IPs for debugging
-        last_ips.push((cs, ip));
-        if last_ips.len() > 20 { last_ips.remove(0); }
-
-        // Detect when we start executing from data (all 00 bytes = suspicious)
-        let linear = machine.cpu.cs_ip();
-        let byte0 = machine.mem.read_u8(linear);
-        let byte1 = machine.mem.read_u8(linear + 1);
-        if byte0 == 0x00 && byte1 == 0x00 && i > 40 {
-            // Trace the last 20 instructions
-            output.push_str(&format!(
-                "\n!!! Executing 00 00 (data?) at {:04X}:{:08X} (linear {:08X}) after {} instructions\n",
-                cs, ip, linear, i
-            ));
-            output.push_str("Last 20 IPs:\n");
-            for (cs2, ip2) in &last_ips {
-                let lin2 = if *cs2 == 0xF000 { ((*cs2 as u32) << 4) + *ip2 } else { machine.cpu.cs_cache.base + *ip2 };
-                let b = machine.mem.read_u8(lin2);
-                output.push_str(&format!("  {:04X}:{:08X} (lin {:08X}) byte={:02X}\n", cs2, ip2, lin2, b));
-            }
-            break;
-        }
-        // Trace normally
-        // Trace qemu_preinit and nearby
         let lip = machine.cpu.cs_ip();
-        if i >= 200_000 && i < 200_050 {
-            output.push_str(&format!("LOOP STATE: EAX={:08X} EBX={:08X} ESI={:08X} EDI={:08X}\n",
-                machine.cpu.eax, machine.cpu.ebx, machine.cpu.esi, machine.cpu.edi));
-            // Follow the linked list from EAX (node->next at [+0x00])
-            let mut ptr = machine.cpu.eax;
-            for j in 0..200 {
-                if ptr == 0 { break; }
-                let next = machine.mem.read_u32(ptr); // [+0x00] = next ptr
-                output.push_str(&format!("  node[{}]: ptr={:08X} [+00]={:08X} [+04]={:08X} [+08]={:08X} [+0C]={:08X} [+10]={:08X}\n",
-                    j, ptr, next, machine.mem.read_u32(ptr+4), machine.mem.read_u32(ptr+8),
-                    machine.mem.read_u32(ptr+0xC), machine.mem.read_u32(ptr+0x10)));
-                if next == ptr { output.push_str("  !!! SELF-LOOP\n"); break; }
-                ptr = next;
-            }
-            // Dump the loop code
-            output.push_str(&format!("\n=== Loop code at {:08X} ===\n", machine.cpu.cs_ip()));
-            let mut addr = 0x07FAD460u32;
-            for _ in 0..30 {
-                let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, addr);
-                let mut bytes = String::new();
-                for j in 0..inst.len.min(8) as u32 {
-                    bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(addr + j)));
-                }
-                output.push_str(&format!("  {:08X}  {:<24} {:?}\n", addr, bytes.trim(), inst.op));
-                addr += inst.len as u32;
-            }
-        }
-        if i >= 200_000 && i < 200_100 {
-            let inst = decode::decode(&machine.cpu, &machine.mem);
-            let linear = machine.cpu.cs_ip();
-            let mut bytes = String::new();
-            for j in 0..inst.len.min(10) as u32 {
-                bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(linear + j)));
-            }
-            output.push_str(&format!(
-                "T{:6}: {:<24} {:?}  A={:08X} B={:08X} C={:08X} D={:08X} SI={:08X} DI={:08X} BP={:08X} FL={:08X}\n",
-                i, bytes.trim(), inst.op,
-                machine.cpu.eax, machine.cpu.ebx, machine.cpu.ecx, machine.cpu.edx,
-                machine.cpu.esi, machine.cpu.edi, machine.cpu.ebp, machine.cpu.eflags
-            ));
-            // After instruction 37 (CALL), dump stack
-            if i == 37 {
-                output.push_str("  === Stack after PUSH+PUSH+CALL ===\n");
-                let sp = machine.cpu.esp;
-                for j in 0..6u32 {
-                    output.push_str(&format!("    [{:08X}] = {:08X}\n",
-                        sp + j*4, machine.mem.read_u32(sp + j*4)));
-                }
-            }
-        }
 
-        // Detect infinite loops
-        if (cs, ip) == last_cs_ip {
-            loop_count += 1;
-            if loop_count > 100_000 {
-                output.push_str(&format!(
-                    "\n!!! Infinite loop detected at {:04X}:{:04X} after {} instructions\n",
-                    cs, ip, i
-                ));
-                break;
+        // Detect serial output growth
+        if machine.serial_output.len() > last_serial_len {
+            let new_text = String::from_utf8_lossy(&machine.serial_output[last_serial_len..]);
+            for line in new_text.split('\n') {
+                if !line.is_empty() {
+                    output.push_str(&format!("[serial @{:>8}] {}\n", i, line));
+                }
             }
-        } else {
-            loop_count = 0;
-            last_cs_ip = (cs, ip);
+            last_serial_len = machine.serial_output.len();
         }
 
         // Trace first N instructions
-        if i < trace_count {
-            let inst = decode::decode(&machine.cpu, &machine.mem);
-            let mut bytes = String::new();
-            let linear = machine.cpu.cs_ip();
-            for j in 0..inst.len.min(8) as u32 {
-                bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(linear + j)));
+        if i < trace_first {
+            trace_one(&mut output, machine, i);
+        }
+
+        // Loop detection: if IP stays in same 0x100 range
+        let range = lip & !0xFF;
+        if range == loop_range_start {
+            loop_count += 1;
+        } else {
+            if loop_count > 10000 && !loop_traced {
+                output.push_str(&format!(
+                    "\n[loop detected: {} iterations in range {:08X}-{:08X}, left at inst {}]\n",
+                    loop_count, loop_range_start, loop_range_start + 0xFF, i
+                ));
             }
+            loop_range_start = range;
+            loop_count = 0;
+        }
+
+        // When stuck in loop for 100K iterations, trace 100 instructions then break
+        if loop_count == 15_000 && !loop_traced {
+            loop_traced = true;
             output.push_str(&format!(
-                "{:5}: {:04X}:{:04X}  {:<24} {:?}\n",
-                i, cs, ip, bytes.trim(), inst.op
+                "\n!!! Stuck in loop at {:08X} for 1M iterations (inst {})\n",
+                lip, i
             ));
+            output.push_str(&format!(
+                "Regs: A={:08X} B={:08X} C={:08X} D={:08X} SI={:08X} DI={:08X} BP={:08X} SP={:08X}\n",
+                machine.cpu.eax, machine.cpu.ebx, machine.cpu.ecx, machine.cpu.edx,
+                machine.cpu.esi, machine.cpu.edi, machine.cpu.ebp, machine.cpu.esp
+            ));
+
+            // Trace 100 instructions
+            for j in 0..100 {
+                trace_one(&mut output, machine, i + j);
+                match machine.step() {
+                    Ok(ExecResult::Continue) => {}
+                    Ok(ExecResult::Halt) => { output.push_str("  HALT\n"); break; }
+                    Ok(ExecResult::UnknownOpcode(b)) => {
+                        output.push_str(&format!("  UNKNOWN 0x{:02X}\n", b)); break;
+                    }
+                    _ => break,
+                }
+            }
+            break;
         }
 
         match machine.step() {
             Ok(ExecResult::Continue) => {}
             Ok(ExecResult::Halt) => {
-                output.push_str(&format!(
-                    "\nCPU halted at {:04X}:{:04X} after {} instructions\n",
-                    machine.cpu.cs, machine.cpu.eip, i
-                ));
+                output.push_str(&format!("\nHALT at {:04X}:{:04X} after {} inst\n", cs, ip, i));
                 break;
             }
             Ok(ExecResult::UnknownOpcode(byte)) => {
-                unknown_opcodes.push((byte, cs, ip));
-                output.push_str(&format!(
-                    "\n!!! Unknown opcode 0x{:02X} at {:04X}:{:04X} after {} instructions\n",
-                    byte, cs, ip, i
-                ));
+                output.push_str(&format!("\n!!! Unknown 0x{:02X} at {:04X}:{:04X} after {} inst\n", byte, cs, ip, i));
                 break;
             }
-            Ok(ExecResult::DivideError) => {
-                output.push_str(&format!(
-                    "\n!!! Divide error at {:04X}:{:04X} after {} instructions\n",
-                    cs, ip, i
-                ));
-                break;
-            }
+            Ok(ExecResult::DivideError) => {}
             Err(e) => {
-                output.push_str(&format!("\n!!! Error: {} after {} instructions\n", e, i));
+                output.push_str(&format!("\n!!! Error: {} after {} inst\n", e, i));
                 break;
             }
         }
     }
 
-    // Dump 10 instructions at final IP
-    output.push_str("\n=== Instructions at final IP ===\n");
-    {
-        let mut addr = machine.cpu.cs_ip();
-        for _ in 0..10 {
-            let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, addr);
-            let mut bytes = String::new();
-            for j in 0..inst.len.min(8) as u32 {
-                bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(addr + j)));
-            }
-            output.push_str(&format!(
-                "  {:08X}  {:<24} {:?}\n",
-                addr, bytes.trim(), inst.op
-            ));
-            addr += inst.len as u32;
-        }
-    }
-
-    // Dump final state
     output.push_str(&format!(
-        "\n=== Final State ===\n\
-         AX={:08X} BX={:08X} CX={:08X} DX={:08X}\n\
-         SP={:08X} BP={:08X} SI={:08X} DI={:08X}\n\
-         CS={:04X} DS={:04X} ES={:04X} SS={:04X}\n\
-         IP={:08X} FLAGS={:08X}\n\
-         CR0={:08X} Mode={:?}\n\
-         Instructions executed: {}\n",
-        machine.cpu.eax, machine.cpu.ebx, machine.cpu.ecx, machine.cpu.edx,
-        machine.cpu.esp, machine.cpu.ebp, machine.cpu.esi, machine.cpu.edi,
-        machine.cpu.cs, machine.cpu.ds, machine.cpu.es, machine.cpu.ss,
-        machine.cpu.eip, machine.cpu.eflags,
-        machine.cpu.cr0, machine.cpu.mode,
+        "\n=== Final ===\nSerial: {} bytes | VGA: {} | Inst: {}\n",
+        machine.serial_output.len(),
+        if (0..4000u32).any(|i| machine.mem.read_u8(0xB8000 + i) != 0) { "has content" } else { "empty" },
         machine.instruction_count,
     ));
 
-    // Check VGA buffer
-    let mut vga_has_content = false;
-    for i in 0..(80 * 25 * 2) as u32 {
-        if machine.mem.read_u8(0xB8000 + i) != 0 {
-            vga_has_content = true;
-            break;
-        }
-    }
-    output.push_str(&format!("VGA buffer has content: {}\n", vga_has_content));
-
-    // Check serial output (POST codes)
-    output.push_str(&format!("POST code (port 0x80): check device\n"));
-
     output
+}
+
+fn trace_one(output: &mut String, machine: &Machine, i: u64) {
+    let lip = machine.cpu.cs_ip();
+    let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, lip);
+    let mut bytes = String::new();
+    for j in 0..inst.len.min(8) as u32 {
+        bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(lip + j)));
+    }
+    output.push_str(&format!(
+        "{:>8}: {:08X}  {:<24} {:?}  A={:08X} B={:08X} BP={:08X} FL={:04X}\n",
+        i, lip, bytes.trim(), inst.op,
+        machine.cpu.eax, machine.cpu.ebx, machine.cpu.ebp, machine.cpu.eflags as u16
+    ));
 }
