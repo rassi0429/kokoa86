@@ -1,12 +1,11 @@
 use crate::Machine;
-use kokoa86_cpu::decode;
 use kokoa86_cpu::execute::ExecResult;
 use kokoa86_mem::MemoryAccess;
 
 pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> String {
     let mut output = String::new();
     let mut last_serial_len = 0usize;
-    let mut alloc_count = 0u32;
+    let mut sample_count = 0u32;
 
     for i in 0..max_inst {
         let lip = machine.cpu.cs_ip();
@@ -21,48 +20,62 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
             last_serial_len = machine.serial_output.len();
         }
 
-        // alloc tracking disabled — address changes with relocation
-
-        // Trace the caller of alloc #6 (the 3rd pci_device alloc)
-        // alloc #5 is size=32 at inst ~73411
-        // Trace 700 instructions from inst 73411 to see the full iteration
-        if false && alloc_count == 5 && lip == 0x0FFAD462 {
-            output.push_str(&format!("\n=== Tracing iteration around alloc #5 (inst {}) ===\n", i));
-            // Trace backwards is impossible, so trace forward 700 inst
-            for j in 0..1200u64 {
-                let ii = i + j;
-                let ll = machine.cpu.cs_ip();
-                let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, ll);
-                let mut bytes = String::new();
-                for k in 0..inst.len.min(6) as u32 {
-                    bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(ll + k)));
-                }
-                // Only show CALL, RET, JMP, and key MOV/CMP
-                // Show everything except memset inner loop and alloc_new inner loop
-                let show = !(ll >= 0x000EA973 && ll <= 0x000EA97B)  // skip memset
-                    && !(ll >= 0x0FFAD46E && ll <= 0x0FFAD4A3);  // skip alloc walk
-                if show {
-                    output.push_str(&format!("{:>8}: {:08X} {:<18} {:?}  A={:08X} B={:08X} DI={:08X} FL={:04X}\n",
-                        ii, ll, bytes.trim(), inst.op,
-                        machine.cpu.eax, machine.cpu.ebx, machine.cpu.edi, machine.cpu.eflags as u16));
-                }
-                match machine.step() {
-                    Ok(ExecResult::Continue) => {}
-                    Ok(ExecResult::Halt) => { output.push_str("HALT\n"); break; }
-                    _ => {}
-                }
+        // Sample IP every 10M instructions
+        // Count alloc_new calls
+        if lip == 0x3FFAD462 {
+            sample_count += 1;
+            if sample_count <= 10 {
+                let ret = machine.mem.read_u32(machine.cpu.esp);
+                output.push_str(&format!("[alloc #{} ret={:08X} size={}]\n", sample_count, ret, machine.cpu.edx));
             }
-            break;
+            if sample_count == 100 {
+                output.push_str(&format!("[100 allocs reached at inst {}]\n", i));
+                break;
+            }
+        }
+        if i == 100_000 || i == 1_000_000 {
+            // Count free list nodes in ZoneTmpHigh
+            // ZoneTmpHigh head is at a known address. Find it.
+            // The alloc function reads [EAX] as the zone's first free block.
+            // At alloc entry, EAX = zone pointer. Let's read it.
+            // Actually, just count the list from whatever EAX points to now.
+            let mut ptr = machine.mem.read_u32(machine.cpu.eax);
+            let mut count = 0u32;
+            let mut last = 0u32;
+            while ptr != 0 && count < 100000 {
+                last = ptr;
+                ptr = machine.mem.read_u32(ptr);
+                count += 1;
+            }
+            output.push_str(&format!(
+                "[zone list] head_from_EAX={:08X} nodes={} last_node={:08X}\n",
+                machine.cpu.eax, count, last
+            ));
+        }
+        if i % 10_000_000 == 0 && i > 0 {
+            sample_count += 1;
+            let max_pci_bus = machine.mem.read_u32(0x0F5D0C);
+            output.push_str(&format!(
+                "[sample {:>3} @{:>10}] IP={:08X} serial={} MaxPCIBus?[0F5D0C]={:08X}\n",
+                sample_count, i, lip, machine.serial_output.len(), max_pci_bus
+            ));
+            if sample_count > 20 { break; }
         }
 
         match machine.step() {
             Ok(ExecResult::Continue) => {}
-            Ok(ExecResult::Halt) => { output.push_str(&format!("\nHALT at {:08X}\n", lip)); break; }
-            Ok(ExecResult::UnknownOpcode(b)) => { output.push_str(&format!("\nUNKNOWN 0x{:02X}\n", b)); break; }
+            Ok(ExecResult::Halt) => {
+                output.push_str(&format!("\nHALT at {:08X} after {} inst\n", lip, i));
+                break;
+            }
+            Ok(ExecResult::UnknownOpcode(b)) => {
+                output.push_str(&format!("\nUNKNOWN 0x{:02X} at {:08X}\n", b, lip));
+                break;
+            }
             _ => {}
         }
     }
 
-    output.push_str(&format!("\nSerial: {} bytes, Allocs: {}\n", machine.serial_output.len(), alloc_count));
+    output.push_str(&format!("\nSerial: {} bytes\n", machine.serial_output.len()));
     output
 }
