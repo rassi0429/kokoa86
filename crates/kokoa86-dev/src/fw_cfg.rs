@@ -46,18 +46,18 @@ impl FwCfg {
         self.entries.insert(ram_size_key, ram_data.clone());
 
         // etc/e820: array of e820 entries
-        // Each entry: u64 address, u64 size, u32 type
+        // Each entry: u64 address, u64 size, u32 type (20 bytes each, no padding)
         let mut e820 = Vec::new();
         // Low memory (0 - 0x9FC00): usable
-        e820.extend_from_slice(&0u64.to_le_bytes());
-        e820.extend_from_slice(&(0x9FC00u64).to_le_bytes());
-        e820.extend_from_slice(&1u32.to_le_bytes());
-        e820.extend_from_slice(&0u32.to_le_bytes()); // padding
-        // High memory (1MB - ram_size): usable
-        e820.extend_from_slice(&(0x100000u64).to_le_bytes());
-        e820.extend_from_slice(&(ram_size - 0x100000).to_le_bytes());
-        e820.extend_from_slice(&1u32.to_le_bytes());
-        e820.extend_from_slice(&0u32.to_le_bytes());
+        e820.extend_from_slice(&0u64.to_le_bytes());       // address
+        e820.extend_from_slice(&(0x9FC00u64).to_le_bytes()); // size
+        e820.extend_from_slice(&1u32.to_le_bytes());        // type: RAM
+        // High memory (1MB - ram_size): usable (if RAM > 1MB)
+        if ram_size > 0x100000 {
+            e820.extend_from_slice(&(0x100000u64).to_le_bytes());
+            e820.extend_from_slice(&(ram_size - 0x100000).to_le_bytes());
+            e820.extend_from_slice(&1u32.to_le_bytes());
+        }
         self.entries.insert(e820_key, e820.clone());
 
         // File directory (key 0x0019)
@@ -107,10 +107,13 @@ impl PortDevice for FwCfg {
         }
     }
 
-    fn port_out(&mut self, port: u16, _size: u8, val: u32) {
+    fn port_out(&mut self, port: u16, size: u8, val: u32) {
         if port == 0x510 {
-            self.selector = val as u16;
+            // Selector can be written as 16-bit
+            self.selector = if size >= 2 { val as u16 } else { val as u16 };
             self.offset = 0;
+            let data_len = self.entries.get(&self.selector).map(|v| v.len()).unwrap_or(0);
+            log::trace!("fw_cfg: SELECT key=0x{:04X} data_len={}", self.selector, data_len);
         }
     }
 

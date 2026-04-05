@@ -524,12 +524,15 @@ pub fn execute(
 
         // === REP ===
         Opcode::Rep(inner) => {
-            while cpu.get_reg16(1) != 0 {
+            let use_ecx = eip_32bit; // 32-bit mode uses ECX
+            while (if use_ecx { cpu.ecx } else { cpu.get_reg16(1) as u32 }) != 0 {
                 let tmp = Instruction { op: (**inner).clone(), len: 0, operand_size: inst.operand_size, addr_size: inst.addr_size, segment_override: inst.segment_override };
                 execute(cpu, mem, ports, int_handler, &tmp);
-                let cx = cpu.get_reg16(1).wrapping_sub(1);
-                cpu.set_reg16(1, cx);
-                // For CMPS/SCAS with REPE, stop if ZF=0
+                if use_ecx {
+                    cpu.ecx = cpu.ecx.wrapping_sub(1);
+                } else {
+                    cpu.set_reg16(1, cpu.get_reg16(1).wrapping_sub(1));
+                }
                 match **inner {
                     Opcode::Cmpsb | Opcode::Cmpsv | Opcode::Scasb | Opcode::Scasv => {
                         if !get_flag(cpu, FLAG_ZF) { break; }
@@ -540,11 +543,15 @@ pub fn execute(
             cpu.eip = next_ip;
         }
         Opcode::Repne(inner) => {
-            while cpu.get_reg16(1) != 0 {
+            let use_ecx = eip_32bit;
+            while (if use_ecx { cpu.ecx } else { cpu.get_reg16(1) as u32 }) != 0 {
                 let tmp = Instruction { op: (**inner).clone(), len: 0, operand_size: inst.operand_size, addr_size: inst.addr_size, segment_override: inst.segment_override };
                 execute(cpu, mem, ports, int_handler, &tmp);
-                let cx = cpu.get_reg16(1).wrapping_sub(1);
-                cpu.set_reg16(1, cx);
+                if use_ecx {
+                    cpu.ecx = cpu.ecx.wrapping_sub(1);
+                } else {
+                    cpu.set_reg16(1, cpu.get_reg16(1).wrapping_sub(1));
+                }
                 match **inner {
                     Opcode::Cmpsb | Opcode::Cmpsv | Opcode::Scasb | Opcode::Scasv => {
                         if get_flag(cpu, FLAG_ZF) { break; }
@@ -1088,53 +1095,42 @@ pub fn execute(
         Opcode::Insb => {
             let port = cpu.get_reg16(2);
             let val = ports.port_in(port, 1);
-            let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+            let addr = seg_addr_edi(cpu, false);
             mem.write_u8(addr, val as u8);
-            let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
-            cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+            advance_di(cpu, 1, eip_32bit);
             cpu.eip = next_ip;
         }
-        // === INSV ===
         Opcode::Insv => {
             let port = cpu.get_reg16(2);
-            let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+            let addr = seg_addr_edi(cpu, false);
+            let pm = cpu.mode == crate::regs::CpuMode::ProtectedMode;
             if is32 {
-                let val = ports.port_in(port, 4);
-                mem.write_u32(addr, val);
-                let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
-                cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+                mem.write_u32(addr, ports.port_in(port, 4));
+                advance_di(cpu, 4, pm);
             } else {
-                let val = ports.port_in(port, 2);
-                mem.write_u16(addr, val as u16);
-                let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
-                cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+                mem.write_u16(addr, ports.port_in(port, 2) as u16);
+                advance_di(cpu, 2, pm);
             }
             cpu.eip = next_ip;
         }
-        // === OUTSB ===
         Opcode::Outsb => {
             let port = cpu.get_reg16(2);
-            let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
-            let val = mem.read_u8(addr) as u32;
-            ports.port_out(port, 1, val);
-            let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
-            cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+            let addr = seg_addr_esi(cpu, false);
+            ports.port_out(port, 1, mem.read_u8(addr) as u32);
+            let pm = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+            advance_si(cpu, 1, pm);
             cpu.eip = next_ip;
         }
-        // === OUTSV ===
         Opcode::Outsv => {
             let port = cpu.get_reg16(2);
-            let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+            let addr = seg_addr_esi(cpu, false);
+            let pm = cpu.mode == crate::regs::CpuMode::ProtectedMode;
             if is32 {
-                let val = mem.read_u32(addr);
-                ports.port_out(port, 4, val);
-                let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
-                cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+                ports.port_out(port, 4, mem.read_u32(addr));
+                advance_si(cpu, 4, pm);
             } else {
-                let val = mem.read_u16(addr) as u32;
-                ports.port_out(port, 2, val);
-                let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
-                cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+                ports.port_out(port, 2, mem.read_u16(addr) as u32);
+                advance_si(cpu, 2, pm);
             }
             cpu.eip = next_ip;
         }
@@ -1801,117 +1797,152 @@ fn update_flags_logic_preserve_cf(cpu: &mut CpuState, result: u32, width: u8) {
     set_flag(cpu, FLAG_CF, cf);
 }
 
-// === String operations ===
+// === String operations (mode-aware) ===
+
+/// Compute DS:SI linear address (mode-aware)
+fn seg_addr_esi(cpu: &CpuState, _use_32: bool) -> u32 {
+    if cpu.mode == crate::regs::CpuMode::ProtectedMode {
+        cpu.ds_cache.base.wrapping_add(cpu.esi)
+    } else {
+        ((cpu.ds as u32) << 4).wrapping_add(cpu.esi & 0xFFFF)
+    }
+}
+
+/// Compute ES:DI linear address (mode-aware)
+fn seg_addr_edi(cpu: &CpuState, _use_32: bool) -> u32 {
+    if cpu.mode == crate::regs::CpuMode::ProtectedMode {
+        cpu.es_cache.base.wrapping_add(cpu.edi)
+    } else {
+        ((cpu.es as u32) << 4).wrapping_add(cpu.edi & 0xFFFF)
+    }
+}
+
+/// Advance SI by `n` bytes (respecting DF and mode)
+fn advance_si(cpu: &mut CpuState, n: u32, use_32: bool) {
+    let delta = if get_flag(cpu, FLAG_DF) { 0u32.wrapping_sub(n) } else { n };
+    if use_32 {
+        cpu.esi = cpu.esi.wrapping_add(delta);
+    } else {
+        cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(delta as u16));
+    }
+}
+
+/// Advance DI by `n` bytes (respecting DF and mode)
+fn advance_di(cpu: &mut CpuState, n: u32, use_32: bool) {
+    let delta = if get_flag(cpu, FLAG_DF) { 0u32.wrapping_sub(n) } else { n };
+    if use_32 {
+        cpu.edi = cpu.edi.wrapping_add(delta);
+    } else {
+        cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(delta as u16));
+    }
+}
+
+/// Advance both SI and DI
+fn advance_si_di(cpu: &mut CpuState, n: u32, use_32: bool) {
+    advance_si(cpu, n, use_32);
+    advance_di(cpu, n, use_32);
+}
 
 fn exec_movsb(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
-    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let src = seg_addr_esi(cpu, false);
+    let dst = seg_addr_edi(cpu, false);
     mem.write_u8(dst, mem.read_u8(src));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
-    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_si_di(cpu, 1, m);
 }
 
 fn exec_movsw(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
-    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let src = seg_addr_esi(cpu, false);
+    let dst = seg_addr_edi(cpu, false);
     mem.write_u16(dst, mem.read_u16(src));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
-    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_si_di(cpu, 2, m);
 }
 
 fn exec_movsd(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
-    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let src = seg_addr_esi(cpu, false);
+    let dst = seg_addr_edi(cpu, false);
     mem.write_u32(dst, mem.read_u32(src));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
-    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_si_di(cpu, 4, m);
 }
 
 fn exec_stosb(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let addr = seg_addr_edi(cpu, false);
     mem.write_u8(addr, cpu.get_reg8(0));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_di(cpu, 1, m);
 }
 
 fn exec_stosw(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let addr = seg_addr_edi(cpu, false);
     mem.write_u16(addr, cpu.get_reg16(0));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_di(cpu, 2, m);
 }
 
 fn exec_stosd(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let addr = seg_addr_edi(cpu, false);
     mem.write_u32(addr, cpu.get_reg32(0));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_di(cpu, 4, m);
 }
 
 fn exec_lodsb(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    let addr = seg_addr_esi(cpu, false);
     cpu.set_reg8(0, mem.read_u8(addr));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
-    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_si(cpu, 1, m);
 }
 
 fn exec_lodsw(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    let addr = seg_addr_esi(cpu, false);
     cpu.set_reg16(0, mem.read_u16(addr));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
-    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_si(cpu, 2, m);
 }
 
 fn exec_lodsd(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+    let addr = seg_addr_esi(cpu, false);
     cpu.set_reg32(0, mem.read_u32(addr));
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
-    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_si(cpu, 4, m);
 }
 
 fn exec_cmpsb(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
-    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let src = seg_addr_esi(cpu, false);
+    let dst = seg_addr_edi(cpu, false);
     let a = mem.read_u8(src) as u32;
     let b = mem.read_u8(dst) as u32;
-    let r = (a as u64).wrapping_sub(b as u64);
-    update_flags_sub(cpu, a, b, r, 8);
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
-    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    update_flags_sub(cpu, a, b, (a as u64).wrapping_sub(b as u64), 8);
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_si_di(cpu, 1, m);
 }
 
 fn exec_cmpsw(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let src = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
-    let dst = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let src = seg_addr_esi(cpu, false);
+    let dst = seg_addr_edi(cpu, false);
     let a = mem.read_u16(src) as u32;
     let b = mem.read_u16(dst) as u32;
-    let r = (a as u64).wrapping_sub(b as u64);
-    update_flags_sub(cpu, a, b, r, 16);
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
-    cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    update_flags_sub(cpu, a, b, (a as u64).wrapping_sub(b as u64), 16);
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_si_di(cpu, 2, m);
 }
 
 fn exec_scasb(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let addr = seg_addr_edi(cpu, false);
     let a = cpu.get_reg8(0) as u32;
     let b = mem.read_u8(addr) as u32;
-    let r = (a as u64).wrapping_sub(b as u64);
-    update_flags_sub(cpu, a, b, r, 8);
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    update_flags_sub(cpu, a, b, (a as u64).wrapping_sub(b as u64), 8);
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_di(cpu, 1, m);
 }
 
 fn exec_scasw(cpu: &mut CpuState, mem: &mut MemoryBus) {
-    let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+    let addr = seg_addr_edi(cpu, false);
     let a = cpu.get_reg16(0) as u32;
     let b = mem.read_u16(addr) as u32;
-    let r = (a as u64).wrapping_sub(b as u64);
-    update_flags_sub(cpu, a, b, r, 16);
-    let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
-    cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+    update_flags_sub(cpu, a, b, (a as u64).wrapping_sub(b as u64), 16);
+    let m = cpu.mode == crate::regs::CpuMode::ProtectedMode;
+    advance_di(cpu, 2, m);
 }
