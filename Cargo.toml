@@ -5,6 +5,7 @@ members = [
     "crates/kokoa86-dev",
     "crates/kokoa86-core",
     "crates/kokoa86-cli",
+    "crates/kokoa86-gui",
 ]
 resolver = "2"
 

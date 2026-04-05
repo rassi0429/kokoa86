@@ -1,0 +1,20 @@
+[package]
+name = "kokoa86-gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kokoa86-gui"
+path = "src/main.rs"
+
+[dependencies]
+kokoa86-core = { path = "../kokoa86-core" }
+kokoa86-cpu = { path = "../kokoa86-cpu" }
+kokoa86-dev = { path = "../kokoa86-dev" }
+kokoa86-mem = { path = "../kokoa86-mem" }
+eframe = "0.31"
+egui = "0.31"
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+clap.workspace = true
