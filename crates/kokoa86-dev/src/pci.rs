@@ -41,28 +41,32 @@ impl PciBus {
     pub fn with_default_devices(mut self) -> Self {
         // Host bridge (device 0:0:0)
         let mut host = [0u8; 256];
-        // Vendor ID = 0x8086 (Intel-like)
-        host[0] = 0x86;
-        host[1] = 0x80;
-        // Device ID = 0x1234
-        host[2] = 0x34;
-        host[3] = 0x12;
-        // Class: Host bridge (06 00)
-        host[0x0B] = 0x06;
-        host[0x0A] = 0x00;
-        // Header type 0
-        host[0x0E] = 0x00;
+        // Intel i440FX Host Bridge at 0:0:0
+        // Vendor ID = 0x8086 (Intel), Device ID = 0x1237 (i440FX)
+        host[0x00] = 0x86; host[0x01] = 0x80; // Vendor ID
+        host[0x02] = 0x37; host[0x03] = 0x12; // Device ID
+        host[0x04] = 0x06; host[0x05] = 0x00; // Command: mem+io
+        host[0x06] = 0x00; host[0x07] = 0x00; // Status
+        host[0x08] = 0x02;                     // Revision
+        host[0x0A] = 0x00;                     // Subclass: Host bridge
+        host[0x0B] = 0x06;                     // Class: Bridge
+        host[0x0E] = 0x00;                     // Header type 0
+        // PAM registers (0x59-0x5F): Programmable Attribute Map
+        // Set all PAM regions to read-write (0x33 = read+write for both halves)
+        for i in 0x59..=0x5F {
+            host[i] = 0x33;
+        }
         self.register_device(0, 0, 0, host);
 
-        // ISA bridge at 0:1:0
+        // Intel PIIX3 ISA Bridge at 0:1:0
+        // Vendor ID = 0x8086, Device ID = 0x7000 (PIIX3)
         let mut isa = [0u8; 256];
-        isa[0] = 0x86;
-        isa[1] = 0x80;
-        isa[2] = 0x00;
-        isa[3] = 0x70;
-        isa[0x0B] = 0x06;
-        isa[0x0A] = 0x01; // ISA bridge
-        isa[0x0E] = 0x80; // multi-function
+        isa[0x00] = 0x86; isa[0x01] = 0x80;
+        isa[0x02] = 0x00; isa[0x03] = 0x70;
+        isa[0x04] = 0x07; isa[0x05] = 0x00; // Command
+        isa[0x0A] = 0x01;                     // Subclass: ISA bridge
+        isa[0x0B] = 0x06;                     // Class: Bridge
+        isa[0x0E] = 0x80;                     // Header type: multi-function
         self.register_device(0, 1, 0, isa);
 
         self
@@ -207,8 +211,8 @@ mod tests {
 
         // Read vendor+device ID (32-bit)
         let val = pci.port_in(0xCFC, 4);
-        // Vendor=0x8086, Device=0x1234 -> little-endian dword = 0x12348086
-        assert_eq!(val, 0x1234_8086);
+        // Vendor=0x8086, Device=0x1237 (i440FX) -> little-endian dword
+        assert_eq!(val, 0x1237_8086);
     }
 
     #[test]

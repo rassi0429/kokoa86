@@ -46,7 +46,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
             break;
         }
         // Trace normally
-        if i >= 25350 && i < 25460 {
+        if false {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();
             let mut bytes = String::new();

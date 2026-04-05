@@ -112,11 +112,7 @@ impl PortDevice for Cmos {
             0x70 => self.index as u32,
             0x71 => {
                 let idx = self.index as usize;
-                if idx < 256 {
-                    self.data[idx] as u32
-                } else {
-                    0
-                }
+                if idx < 256 { self.data[idx] as u32 } else { 0 }
             }
             _ => 0,
         }

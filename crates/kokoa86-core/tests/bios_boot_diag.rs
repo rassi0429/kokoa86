@@ -13,7 +13,7 @@ fn diag_seabios_boot() {
         }
     };
 
-    let mut machine = Machine::new(32 * 1024 * 1024); // 32MB RAM
+    let mut machine = Machine::new(128 * 1024 * 1024); // 128MB RAM
     let serial = Serial8250::new_capture(0x3F8);
     machine.ports.register(Box::new(serial));
     machine.load_bios(bios_data);
@@ -48,6 +48,41 @@ fn diag_seabios_boot() {
     let edx = machine.cpu.get_reg32(2);
     println!("EDX (2nd param): 0x{:08X}", edx);
     // Check memory at what should be stack with fmt string
+    // Verify fw_cfg file directory
+    {
+        use kokoa86_dev::port_bus::PortDevice;
+        // Re-create a fw_cfg instance for inspection
+        let mut fw = kokoa86_dev::FwCfg::new(128 * 1024 * 1024);
+        // Select file directory (key 0x0019)
+        fw.port_out(0x510, 2, 0x0019);
+        // Read file count (4 bytes BE)
+        let b0 = fw.port_in(0x511, 1) as u8;
+        let b1 = fw.port_in(0x511, 1) as u8;
+        let b2 = fw.port_in(0x511, 1) as u8;
+        let b3 = fw.port_in(0x511, 1) as u8;
+        let count = ((b0 as u32) << 24) | ((b1 as u32) << 16) | ((b2 as u32) << 8) | (b3 as u32);
+        println!("fw_cfg file count: {}", count);
+        for i in 0..count {
+            // Each entry: u32 size (BE), u16 select (BE), u16 reserved, [56] name
+            let s0 = fw.port_in(0x511, 1) as u8;
+            let s1 = fw.port_in(0x511, 1) as u8;
+            let s2 = fw.port_in(0x511, 1) as u8;
+            let s3 = fw.port_in(0x511, 1) as u8;
+            let size = ((s0 as u32) << 24) | ((s1 as u32) << 16) | ((s2 as u32) << 8) | (s3 as u32);
+            let k0 = fw.port_in(0x511, 1) as u8;
+            let k1 = fw.port_in(0x511, 1) as u8;
+            let key = ((k0 as u16) << 8) | (k1 as u16);
+            let _r0 = fw.port_in(0x511, 1);
+            let _r1 = fw.port_in(0x511, 1);
+            let mut name = [0u8; 56];
+            for j in 0..56 {
+                name[j] = fw.port_in(0x511, 1) as u8;
+            }
+            let name_str = std::str::from_utf8(&name).unwrap_or("?").trim_end_matches('\0');
+            println!("  File {}: name='{}' key=0x{:04X} size={}", i, name_str, key, size);
+        }
+    }
+
     // Check CMOS RAM registers directly
     use kokoa86_dev::port_bus::PortDevice;
     machine.cmos.port_out(0x70, 1, 0x34);

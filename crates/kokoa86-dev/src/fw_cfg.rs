@@ -81,6 +81,27 @@ impl FwCfg {
         name2[..14].copy_from_slice(b"etc/ram_size\0\0");
         dir.extend_from_slice(&name2);
 
+        // etc/reserved-memory-end: u64 LE — marks the end of low memory
+        let rsvd_end_key: u16 = 0x8005;
+        self.entries.insert(rsvd_end_key, ram_size.to_le_bytes().to_vec());
+
+        // Rebuild file directory with the extra entry
+        // File 3: etc/reserved-memory-end
+        let rsvd_data_len = 8u32; // u64
+        dir.extend_from_slice(&rsvd_data_len.to_be_bytes());
+        dir.extend_from_slice(&rsvd_end_key.to_be_bytes());
+        dir.extend_from_slice(&0u16.to_be_bytes());
+        let mut name3 = [0u8; 56];
+        name3[..25].copy_from_slice(b"etc/reserved-memory-end\0\0");
+        dir.extend_from_slice(&name3);
+
+        // Update file count from 2 to 3
+        let count = 3u32;
+        dir[0] = (count >> 24) as u8;
+        dir[1] = (count >> 16) as u8;
+        dir[2] = (count >> 8) as u8;
+        dir[3] = count as u8;
+
         self.entries.insert(0x0019, dir);
     }
 
