@@ -21,7 +21,7 @@ struct PciDevice {
 }
 
 pub struct PciBus {
-    config_address: u32,
+    pub config_address: u32,
     devices: Vec<PciDevice>,
 }
 

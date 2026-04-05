@@ -5,7 +5,10 @@ use kokoa86_mem::MemoryAccess;
 pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> String {
     let mut output = String::new();
     let mut last_serial_len = 0usize;
-    let mut sample_count = 0u32;
+
+    // Monitor PCI config address writes via port 0xCF8
+    let mut last_pci_cfg = 0u32;
+    let mut pci_vendor_reads = 0u32;
 
     for i in 0..max_inst {
         let lip = machine.cpu.cs_ip();
@@ -20,47 +23,9 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
             last_serial_len = machine.serial_output.len();
         }
 
-        // Sample IP every 10M instructions
-        // Count alloc_new calls
-        if lip == 0x3FFAD462 {
-            sample_count += 1;
-            if sample_count <= 10 {
-                let ret = machine.mem.read_u32(machine.cpu.esp);
-                output.push_str(&format!("[alloc #{} ret={:08X} size={}]\n", sample_count, ret, machine.cpu.edx));
-            }
-            if sample_count == 100 {
-                output.push_str(&format!("[100 allocs reached at inst {}]\n", i));
-                break;
-            }
-        }
-        if i == 100_000 || i == 1_000_000 {
-            // Count free list nodes in ZoneTmpHigh
-            // ZoneTmpHigh head is at a known address. Find it.
-            // The alloc function reads [EAX] as the zone's first free block.
-            // At alloc entry, EAX = zone pointer. Let's read it.
-            // Actually, just count the list from whatever EAX points to now.
-            let mut ptr = machine.mem.read_u32(machine.cpu.eax);
-            let mut count = 0u32;
-            let mut last = 0u32;
-            while ptr != 0 && count < 100000 {
-                last = ptr;
-                ptr = machine.mem.read_u32(ptr);
-                count += 1;
-            }
-            output.push_str(&format!(
-                "[zone list] head_from_EAX={:08X} nodes={} last_node={:08X}\n",
-                machine.cpu.eax, count, last
-            ));
-        }
-        if i % 10_000_000 == 0 && i > 0 {
-            sample_count += 1;
-            let max_pci_bus = machine.mem.read_u32(0x0F5D0C);
-            output.push_str(&format!(
-                "[sample {:>3} @{:>10}] IP={:08X} serial={} MaxPCIBus?[0F5D0C]={:08X}\n",
-                sample_count, i, lip, machine.serial_output.len(), max_pci_bus
-            ));
-            if sample_count > 20 { break; }
-        }
+        // Detect OUT to 0xCF8 (PCI config address) via OutDxAx/OutDxAl pattern
+        // Simpler: just check PCI state after each step
+        let pre_pci_cfg = machine.pci.config_address;
 
         match machine.step() {
             Ok(ExecResult::Continue) => {}
@@ -74,8 +39,33 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
             }
             _ => {}
         }
+
+        // Detect PCI config address change
+        let post_pci_cfg = machine.pci.config_address;
+        if post_pci_cfg != pre_pci_cfg && (post_pci_cfg & 0x80000000) != 0 {
+            let reg = post_pci_cfg & 0xFC;
+            let bdf = (post_pci_cfg >> 8) & 0xFFFF;
+            let bus = (bdf >> 8) & 0xFF;
+            let dev = (bdf >> 3) & 0x1F;
+            let func = bdf & 0x07;
+
+            if reg == 0 && i > 67000 { // vendor reads after probing message
+                pci_vendor_reads += 1;
+                if pci_vendor_reads <= 100 {
+                    output.push_str(&format!(
+                        "[pci_vendor #{:>3} @{:>8}] bdf={:04X} bus={} dev={} fn={}\n",
+                        pci_vendor_reads, i, bdf, bus, dev, func
+                    ));
+                }
+                if pci_vendor_reads == 100 {
+                    output.push_str("[... stopping at 100 vendor reads]\n");
+                    break;
+                }
+            }
+        }
     }
 
-    output.push_str(&format!("\nSerial: {} bytes\n", machine.serial_output.len()));
+    output.push_str(&format!("\nSerial: {} bytes, vendor_reads: {}\n",
+        machine.serial_output.len(), pci_vendor_reads));
     output
 }
