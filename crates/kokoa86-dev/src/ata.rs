@@ -16,6 +16,7 @@
 use crate::port_bus::PortDevice;
 
 /// Status register bits
+#[allow(dead_code)]
 const STATUS_BSY: u8 = 0x80;
 const STATUS_DRDY: u8 = 0x40;
 const STATUS_DRQ: u8 = 0x08;

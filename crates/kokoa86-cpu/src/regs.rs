@@ -152,7 +152,11 @@ impl CpuState {
 
     /// Current CS:IP linear address
     pub fn cs_ip(&self) -> u32 {
-        self.linear_addr(self.cs, self.eip as u16)
+        if self.mode == CpuMode::ProtectedMode {
+            self.cs_cache.base.wrapping_add(self.eip)
+        } else {
+            ((self.cs as u32) << 4).wrapping_add(self.eip as u16 as u32)
+        }
     }
 
     /// Read 8-bit register by index (AL=0, CL=1, DL=2, BL=3, AH=4, CH=5, DH=6, BH=7)
