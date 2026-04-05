@@ -129,8 +129,8 @@ pub fn execute(
         }
 
         Opcode::MovSregRm(reg, rm, _) => {
-            let val = read_rmv(cpu, mem, rm, false);
-            cpu.set_sreg(*reg, val as u16);
+            let val = read_rmv(cpu, mem, rm, false) as u16;
+            crate::descriptor::load_segment(cpu, mem, *reg, val);
             cpu.eip = next_ip;
         }
         Opcode::MovRmSreg(reg, rm, _) => {
@@ -286,7 +286,7 @@ pub fn execute(
             if !is32 { cpu.eip &= 0xFFFF; }
         }
         Opcode::JmpFar(seg, offset) => {
-            cpu.cs = *seg;
+            crate::descriptor::load_segment(cpu, mem, 1, *seg); // CS = index 1
             cpu.eip = *offset;
         }
         Opcode::Jcc(cc, disp) => {
@@ -313,7 +313,7 @@ pub fn execute(
         Opcode::CallFar(seg, offset) => {
             pushv(cpu, mem, cpu.cs as u32, is32);
             pushv(cpu, mem, next_ip, is32);
-            cpu.cs = *seg;
+            crate::descriptor::load_segment(cpu, mem, 1, *seg);
             cpu.eip = *offset;
         }
         Opcode::Ret => {
@@ -328,15 +328,15 @@ pub fn execute(
         }
         Opcode::Retf => {
             let ip = popv(cpu, mem, is32);
-            let cs = popv(cpu, mem, is32);
+            let cs = popv(cpu, mem, is32) as u16;
+            crate::descriptor::load_segment(cpu, mem, 1, cs);
             cpu.eip = ip;
-            cpu.cs = cs as u16;
         }
         Opcode::RetfImm16(imm) => {
             let ip = popv(cpu, mem, is32);
-            let cs = popv(cpu, mem, is32);
+            let cs = popv(cpu, mem, is32) as u16;
+            crate::descriptor::load_segment(cpu, mem, 1, cs);
             cpu.eip = ip;
-            cpu.cs = cs as u16;
             let sp = cpu.esp.wrapping_add(*imm as u32);
             cpu.esp = if is32 { sp } else { (cpu.esp & 0xFFFF0000) | (sp & 0xFFFF) };
         }

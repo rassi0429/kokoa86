@@ -2,7 +2,7 @@ use anyhow::Result;
 use kokoa86_cpu::decode;
 use kokoa86_cpu::execute::{self, ExecResult, IntHandler, PortIo};
 use kokoa86_cpu::CpuState;
-use kokoa86_dev::{AtaDisk, Pic8259, Pit8253, PortBus, Ps2Controller, VgaText, vga};
+use kokoa86_dev::{AtaDisk, Cmos, Pic8259, Pit8253, PortBus, Ps2Controller, VgaText, vga};
 use kokoa86_dev::port_bus::PortDevice;
 use kokoa86_mem::{MemoryAccess, MemoryBus};
 
@@ -17,6 +17,7 @@ pub struct Machine {
     pub pit: Pit8253,
     pub ps2: Ps2Controller,
     pub ata: AtaDisk,
+    pub cmos: Cmos,
     pub bios_stubs: bool,
     pub instruction_count: u64,
 }
@@ -33,6 +34,8 @@ impl Machine {
             pit: Pit8253::new(),
             ps2: Ps2Controller::new(),
             ata: AtaDisk::new(),
+            cmos: Cmos::new((ram_size / 1024).min(640) as u16,
+                            if ram_size > 1024*1024 { ((ram_size - 1024*1024) / 1024) as u16 } else { 0 }),
             bios_stubs: true,
             instruction_count: 0,
         }
@@ -100,6 +103,7 @@ impl Machine {
             pit: &mut self.pit,
             ps2: &mut self.ps2,
             ata: &mut self.ata,
+            cmos: &mut self.cmos,
         };
         let mut int_adapter = BiosStubHandler {
             enabled: self.bios_stubs,
@@ -197,6 +201,7 @@ struct DevicePortAdapter<'a> {
     pit: &'a mut Pit8253,
     ps2: &'a mut Ps2Controller,
     ata: &'a mut AtaDisk,
+    cmos: &'a mut Cmos,
 }
 
 impl PortIo for DevicePortAdapter<'_> {
@@ -206,6 +211,7 @@ impl PortIo for DevicePortAdapter<'_> {
             0xA0..=0xA1 => return self.pic_slave.port_in(port, size),
             0x40..=0x43 => return self.pit.port_in(port, size),
             0x60 | 0x64 => return self.ps2.port_in(port, size),
+            0x70..=0x71 => return self.cmos.port_in(port, size),
             0x1F0..=0x1F7 | 0x3F6 => return self.ata.port_in(port, size),
             0x3C0..=0x3CF | 0x3D4..=0x3DA => return self.vga.port_in(port) as u32,
             _ => {}
@@ -219,6 +225,7 @@ impl PortIo for DevicePortAdapter<'_> {
             0xA0..=0xA1 => { self.pic_slave.port_out(port, size, val); return; }
             0x40..=0x43 => { self.pit.port_out(port, size, val); return; }
             0x60 | 0x64 => { self.ps2.port_out(port, size, val); return; }
+            0x70..=0x71 => { self.cmos.port_out(port, size, val); return; }
             0x1F0..=0x1F7 | 0x3F6 => { self.ata.port_out(port, size, val); return; }
             0x3C0..=0x3CF | 0x3D4..=0x3DA => { self.vga.port_out(port, val as u8); return; }
             _ => {}

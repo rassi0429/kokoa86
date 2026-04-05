@@ -1,4 +1,5 @@
 pub mod ata;
+pub mod cmos;
 pub mod pic;
 pub mod pit;
 pub mod port_bus;
@@ -7,6 +8,7 @@ pub mod serial;
 pub mod vga;
 
 pub use ata::AtaDisk;
+pub use cmos::Cmos;
 pub use pic::Pic8259;
 pub use pit::Pit8253;
 pub use port_bus::PortBus;
