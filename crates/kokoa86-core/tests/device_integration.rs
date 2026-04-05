@@ -87,9 +87,9 @@ fn test_pic_timer_interrupt() {
     code.extend_from_slice(&[
         0xB0, 0x34, // MOV AL, 0x34  (ch0, lo/hi, mode 2)
         0xE6, 0x43, // OUT 0x43, AL
-        0xB0, 0x02, // MOV AL, 0x02  (counter low = 2)
+        0xB0, 0xE8, // MOV AL, 0xE8  (counter low = 1000 & 0xFF)
         0xE6, 0x40, // OUT 0x40, AL
-        0xB0, 0x00, // MOV AL, 0x00  (counter high = 0)
+        0xB0, 0x03, // MOV AL, 0x03  (counter high = 1000 >> 8)
         0xE6, 0x40, // OUT 0x40, AL
         0xFB,       // STI
     ]);

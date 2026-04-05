@@ -13,6 +13,11 @@ struct PciDevice {
     device: u8,
     function: u8,
     config: [u8; 256],
+    /// Write mask for config space: bit=1 means writable.
+    /// BAR regions (0x10-0x27) use this to report correct BAR size.
+    /// For BARs: mask = ~(size - 1) for the address bits.
+    /// A mask of 0 for BAR means "BAR not present".
+    writemask: [u8; 256],
 }
 
 pub struct PciBus {
@@ -29,11 +34,26 @@ impl PciBus {
     }
 
     pub fn register_device(&mut self, bus: u8, device: u8, function: u8, config: [u8; 256]) {
+        // Default writemask: most registers writable, but read-only fields masked
+        let mut writemask = [0xFF_u8; 256];
+        // Vendor ID (0x00-0x01): read-only
+        writemask[0x00] = 0; writemask[0x01] = 0;
+        // Device ID (0x02-0x03): read-only
+        writemask[0x02] = 0; writemask[0x03] = 0;
+        // Status (0x06-0x07): write-1-to-clear for some bits, mostly read-only
+        writemask[0x06] = 0; writemask[0x07] = 0;
+        // Revision (0x08): read-only
+        writemask[0x08] = 0;
+        // Class/Subclass/ProgIF (0x09-0x0B): read-only
+        writemask[0x09] = 0; writemask[0x0A] = 0; writemask[0x0B] = 0;
+        // Header type (0x0E): read-only
+        writemask[0x0E] = 0;
+        // BARs (0x10-0x27): set to 0 (no BARs for bridges)
+        for i in 0x10..=0x27 {
+            writemask[i] = 0;
+        }
         self.devices.push(PciDevice {
-            bus,
-            device,
-            function,
-            config,
+            bus, device, function, config, writemask,
         });
     }
 
@@ -161,29 +181,32 @@ impl PortDevice for PciBus {
                     let dev = &mut self.devices[idx];
                     let base = register as usize;
 
+                    // Apply writemask: only writable bits can change
                     match size {
                         1 => {
                             let addr = base + byte_offset as usize;
                             if addr < 256 {
-                                dev.config[addr] = val as u8;
+                                let mask = dev.writemask[addr];
+                                dev.config[addr] = (dev.config[addr] & !mask) | (val as u8 & mask);
                             }
                         }
                         2 => {
                             let addr = base + byte_offset as usize;
                             let bytes = (val as u16).to_le_bytes();
-                            if addr + 1 < 256 {
-                                dev.config[addr] = bytes[0];
-                                dev.config[addr + 1] = bytes[1];
+                            for i in 0..2 {
+                                if addr + i < 256 {
+                                    let mask = dev.writemask[addr + i];
+                                    dev.config[addr + i] = (dev.config[addr + i] & !mask) | (bytes[i] & mask);
+                                }
                             }
                         }
                         _ => {
-                            // 32-bit write to base register
                             let bytes = val.to_le_bytes();
-                            if base + 3 < 256 {
-                                dev.config[base] = bytes[0];
-                                dev.config[base + 1] = bytes[1];
-                                dev.config[base + 2] = bytes[2];
-                                dev.config[base + 3] = bytes[3];
+                            for i in 0..4 {
+                                if base + i < 256 {
+                                    let mask = dev.writemask[base + i];
+                                    dev.config[base + i] = (dev.config[base + i] & !mask) | (bytes[i] & mask);
+                                }
                             }
                         }
                     }
