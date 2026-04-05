@@ -1,0 +1,16 @@
+[package]
+name = "kokoa86"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kokoa86"
+path = "src/main.rs"
+
+[dependencies]
+kokoa86-core = { path = "../kokoa86-core" }
+kokoa86-dev = { path = "../kokoa86-dev" }
+clap.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true

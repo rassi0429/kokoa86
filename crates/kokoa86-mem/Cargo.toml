@@ -1,0 +1,8 @@
+[package]
+name = "kokoa86-mem"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "kokoa86-cpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kokoa86-mem = { path = "../kokoa86-mem" }
+log.workspace = true
+thiserror.workspace = true
+bitflags.workspace = true

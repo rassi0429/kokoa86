@@ -1,0 +1,11 @@
+[package]
+name = "kokoa86-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kokoa86-cpu = { path = "../kokoa86-cpu" }
+kokoa86-mem = { path = "../kokoa86-mem" }
+kokoa86-dev = { path = "../kokoa86-dev" }
+log.workspace = true
+anyhow.workspace = true
