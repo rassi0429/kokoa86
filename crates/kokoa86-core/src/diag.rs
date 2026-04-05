@@ -1,17 +1,12 @@
 use crate::Machine;
-use kokoa86_cpu::decode;
 use kokoa86_cpu::execute::ExecResult;
 use kokoa86_mem::MemoryAccess;
 
 pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> String {
     let mut output = String::new();
     let mut last_serial_len = 0usize;
-    let mut vendor_count = 0u32;
-    let mut tracing = false;
 
     for i in 0..max_inst {
-        let lip = machine.cpu.cs_ip();
-
         if machine.serial_output.len() > last_serial_len {
             let new = String::from_utf8_lossy(&machine.serial_output[last_serial_len..]);
             for line in new.split('\n') {
@@ -22,46 +17,55 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
             last_serial_len = machine.serial_output.len();
         }
 
-        // Trace every instruction between vendor read #34 and #35
-        if tracing {
-            let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, lip);
-            let mut bytes = String::new();
-            for k in 0..inst.len.min(7) as u32 {
-                bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(lip + k)));
+        // Dump zone info once
+        if i == 100_000 {
+            output.push_str("\n=== Zone info @100K ===\n");
+            // ZoneTmpHigh head pointer
+            // ZoneTmpHigh pointer (relocated)
+            // reloc_base = 0x3FFAB420 for 1GB RAM
+            // zone_ptr original ≈ 0x0E???? + delta
+            let zone_ptr_addr = 0x3FFBFE78u32; // 1GB version
+            let zone_head = machine.mem.read_u32(zone_ptr_addr);
+            output.push_str(&format!("ZoneTmpHigh ptr addr: 0x{:08X}\n", zone_ptr_addr));
+            output.push_str(&format!("ZoneTmpHigh head: 0x{:08X}\n", zone_head));
+            if zone_head != 0 {
+                // Walk first 5 nodes
+                let mut node = zone_head;
+                for j in 0..100000 {
+                    if node == 0 { break; }
+                    let next = machine.mem.read_u32(node);
+                    let prev = machine.mem.read_u32(node + 4);
+                    let base = machine.mem.read_u32(node + 8);
+                    let size_end = machine.mem.read_u32(node + 0x0C);
+                    let block_size = machine.mem.read_u32(node + 0x10);
+                    if j < 30 || j % 10000 == 0 {
+                        output.push_str(&format!(
+                            "  [{:>6}] node={:08X} next={:08X} [+08]={:08X} [+0C]={:08X} [+10]={:08X}\n",
+                            j, node, next, base, size_end, block_size
+                        ));
+                    }
+                    node = next;
+                }
             }
-            output.push_str(&format!(
-                "{:>8}: {:08X} {:<21} {:?}  A={:08X} B={:08X} C={:08X} SP={:08X}\n",
-                i, lip, bytes.trim(), inst.op,
-                machine.cpu.eax, machine.cpu.ebx, machine.cpu.ecx, machine.cpu.esp
-            ));
         }
-
-        let pre_cfg = machine.pci.config_address;
+        // Sample every 50M instructions
+        if i % 50_000_000 == 0 && i > 0 {
+            let lip = machine.cpu.cs_ip();
+            output.push_str(&format!("[sample @{:>10}] IP={:08X} serial={}\n", i, lip, machine.serial_output.len()));
+        }
 
         match machine.step() {
             Ok(ExecResult::Continue) => {}
-            Ok(ExecResult::Halt) => { output.push_str(&format!("\nHALT\n")); break; }
-            Ok(ExecResult::UnknownOpcode(b)) => { output.push_str(&format!("\nUNKNOWN 0x{:02X}\n", b)); break; }
-            _ => {}
-        }
-
-        // Detect vendor read
-        let post_cfg = machine.pci.config_address;
-        if post_cfg != pre_cfg && (post_cfg & 0x80000000) != 0 && (post_cfg & 0xFC) == 0 {
-            vendor_count += 1;
-            if vendor_count == 34 {
-                let bdf = (post_cfg >> 8) & 0xFFFF;
-                output.push_str(&format!("\n>>> VENDOR #{} bdf={:04X} at inst {} — START TRACING\n\n", vendor_count, bdf, i));
-                tracing = true;
-            }
-            if vendor_count == 35 {
-                let bdf = (post_cfg >> 8) & 0xFFFF;
-                output.push_str(&format!("\n>>> VENDOR #{} bdf={:04X} at inst {} — STOP\n", vendor_count, bdf, i));
+            Ok(ExecResult::Halt) => {
+                output.push_str(&format!("\nHALT at {:08X} after {} inst\n", machine.cpu.cs_ip(), i));
                 break;
             }
+            Ok(ExecResult::UnknownOpcode(b)) => {
+                output.push_str(&format!("\nUNKNOWN 0x{:02X} at {:08X}\n", b, machine.cpu.cs_ip()));
+                break;
+            }
+            _ => {}
         }
-
-        if i > 500_000 { break; }
     }
 
     output.push_str(&format!("\nSerial: {} bytes\n", machine.serial_output.len()));
