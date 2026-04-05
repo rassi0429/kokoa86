@@ -18,6 +18,10 @@ struct Args {
     #[arg(short, long, default_value_t = 1024)]
     ram: usize,
 
+    /// Disk image file (loaded as ATA primary drive)
+    #[arg(short, long)]
+    disk: Option<String>,
+
     /// Disable BIOS interrupt stubs
     #[arg(long)]
     no_bios_stubs: bool,
@@ -47,9 +51,16 @@ fn main() -> Result<()> {
     machine.bios_stubs = !args.no_bios_stubs;
 
     // Register COM1
-    machine
-        .ports
-        .register(Box::new(Serial8250::new(0x3F8)));
+    machine.ports.register(Box::new(Serial8250::new(0x3F8)));
+
+    // Load disk image if provided
+    if let Some(ref disk_path) = args.disk {
+        let disk_data = fs::read(disk_path)
+            .with_context(|| format!("Failed to read disk image: {}", disk_path))?;
+        log::info!("Loading disk image: {} ({} bytes, {} sectors)",
+            disk_path, disk_data.len(), disk_data.len() / 512);
+        machine.load_disk(disk_data);
+    }
 
     // Load binary
     machine.load_at(load_addr, &data);
@@ -57,12 +68,9 @@ fn main() -> Result<()> {
     // Set initial SP to top of conventional memory
     machine.cpu.esp = 0xFFFE;
     machine.cpu.ss = 0x0000;
-
-    // Set IP to load address
     machine.cpu.eip = load_addr as u32;
     machine.cpu.cs = 0x0000;
 
-    // Run
     machine.run()?;
 
     println!();

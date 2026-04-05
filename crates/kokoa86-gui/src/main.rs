@@ -21,6 +21,10 @@ struct Args {
     /// RAM size in KB
     #[arg(short, long, default_value_t = 1024)]
     ram: usize,
+
+    /// Disk image file
+    #[arg(short, long)]
+    disk: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -74,6 +78,14 @@ impl EmulatorApp {
     fn new(args: Args) -> Self {
         let mut machine = Machine::new(args.ram * 1024);
         machine.ports.register(Box::new(Serial8250::new(0x3F8)));
+
+        // Load disk image if provided
+        if let Some(ref disk_path) = args.disk {
+            if let Ok(disk_data) = fs::read(disk_path) {
+                log::info!("Loaded disk: {} ({} bytes)", disk_path, disk_data.len());
+                machine.load_disk(disk_data);
+            }
+        }
 
         let status;
 
@@ -167,6 +179,22 @@ impl EmulatorApp {
             }
             if i.key_pressed(egui::Key::F2) {
                 self.do_reset();
+            }
+
+            // Forward keyboard input to PS/2 controller (when running)
+            if self.running {
+                for event in &i.events {
+                    if let egui::Event::Key { key, pressed, .. } = event {
+                        if let Some(scancode) = egui_key_to_scancode(*key) {
+                            if *pressed {
+                                self.machine.ps2.send_scancode(scancode);
+                            } else {
+                                // Key release: send break code (0x80 | make code)
+                                self.machine.ps2.send_scancode(0x80 | scancode);
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -601,4 +629,70 @@ fn render_memory_dump(ui: &mut egui::Ui, mem: &kokoa86_mem::MemoryBus, start: u3
             ui.label(job);
         }
     });
+}
+
+/// Map egui key to PS/2 Set 1 scancode (make code)
+fn egui_key_to_scancode(key: egui::Key) -> Option<u8> {
+    Some(match key {
+        egui::Key::Escape => 0x01,
+        egui::Key::Num1 => 0x02,
+        egui::Key::Num2 => 0x03,
+        egui::Key::Num3 => 0x04,
+        egui::Key::Num4 => 0x05,
+        egui::Key::Num5 => 0x06,
+        egui::Key::Num6 => 0x07,
+        egui::Key::Num7 => 0x08,
+        egui::Key::Num8 => 0x09,
+        egui::Key::Num9 => 0x0A,
+        egui::Key::Num0 => 0x0B,
+        egui::Key::Minus => 0x0C,
+        egui::Key::Equals => 0x0D,
+        egui::Key::Backspace => 0x0E,
+        egui::Key::Tab => 0x0F,
+        egui::Key::Q => 0x10,
+        egui::Key::W => 0x11,
+        egui::Key::E => 0x12,
+        egui::Key::R => 0x13,
+        egui::Key::T => 0x14,
+        egui::Key::Y => 0x15,
+        egui::Key::U => 0x16,
+        egui::Key::I => 0x17,
+        egui::Key::O => 0x18,
+        egui::Key::P => 0x19,
+        egui::Key::OpenBracket => 0x1A,
+        egui::Key::CloseBracket => 0x1B,
+        egui::Key::Enter => 0x1C,
+        egui::Key::A => 0x1E,
+        egui::Key::S => 0x1F,
+        egui::Key::D => 0x20,
+        egui::Key::F => 0x21,
+        egui::Key::G => 0x22,
+        egui::Key::H => 0x23,
+        egui::Key::J => 0x24,
+        egui::Key::K => 0x25,
+        egui::Key::L => 0x26,
+        egui::Key::Semicolon => 0x27,
+        egui::Key::Z => 0x2C,
+        egui::Key::X => 0x2D,
+        egui::Key::C => 0x2E,
+        egui::Key::V => 0x2F,
+        egui::Key::B => 0x30,
+        egui::Key::N => 0x31,
+        egui::Key::M => 0x32,
+        egui::Key::Comma => 0x33,
+        egui::Key::Period => 0x34,
+        egui::Key::Slash => 0x35,
+        egui::Key::Space => 0x39,
+        egui::Key::ArrowUp => 0x48,
+        egui::Key::ArrowLeft => 0x4B,
+        egui::Key::ArrowRight => 0x4D,
+        egui::Key::ArrowDown => 0x50,
+        egui::Key::Home => 0x47,
+        egui::Key::End => 0x4F,
+        egui::Key::PageUp => 0x49,
+        egui::Key::PageDown => 0x51,
+        egui::Key::Insert => 0x52,
+        egui::Key::Delete => 0x53,
+        _ => return None,
+    })
 }
