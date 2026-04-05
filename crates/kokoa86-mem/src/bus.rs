@@ -32,13 +32,14 @@ impl MemoryBus {
     }
 
     /// Map a ROM at a specific base address.
-    /// Reads in this range return ROM data; writes go to underlying RAM (shadowing).
+    /// Simply loads data into RAM. No write-protection (SeaBIOS needs
+    /// to shadow/copy ROM into RAM during initialization).
     pub fn map_rom(&mut self, base: u32, data: Vec<u8>) {
-        // Also copy to RAM so writes to ROM area land in RAM
         if (base as usize) + data.len() <= self.ram.size() {
             self.ram.load(base as usize, &data);
         }
-        self.rom = Some(RomRegion { base, data });
+        // No ROM overlay — BIOS code runs directly from RAM after copy.
+        // This allows SeaBIOS to modify its own code region during init.
     }
 
     /// Read a slice of bytes (for instruction fetch, etc.)

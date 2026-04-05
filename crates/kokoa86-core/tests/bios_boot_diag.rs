@@ -20,6 +20,13 @@ fn diag_seabios_boot() {
     let report = kokoa86_core::diag::trace_boot(&mut machine, 2_000_000, 50);
     println!("{}", report);
 
+    // Verify ROM is readable at the expected address
+    println!("\n=== ROM verification ===");
+    println!("Byte at 0xD2AE0 AFTER execution: {:02X} (expect 0xD5)", machine.mem.read_u8(0xD2AE0));
+    println!("Byte at 0xD2AE1: {:02X} (expect 0x06)", machine.mem.read_u8(0xD2AE1));
+    println!("Byte at 0xFCFA9: {:02X}", machine.mem.read_u8(0xFCFA9));
+    println!("Byte at 0xFFFF0: {:02X} (expect 0xEA)", machine.mem.read_u8(0xFFFF0));
+
     // Dump GDT entries
     use kokoa86_mem::MemoryAccess;
     let gdtr_base = machine.cpu.gdtr.base;

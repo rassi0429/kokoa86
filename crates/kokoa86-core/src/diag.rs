@@ -17,9 +17,37 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
         machine.cpu.cs, machine.cpu.eip
     ));
 
+    let mut last_ips: Vec<(u16, u32)> = Vec::new();
+
     for i in 0..max_inst {
         let cs = machine.cpu.cs;
         let ip = machine.cpu.eip;
+
+        // Track last 20 IPs for debugging
+        last_ips.push((cs, ip));
+        if last_ips.len() > 20 { last_ips.remove(0); }
+
+        // Detect EIP going out of reasonable range
+        if machine.cpu.cs_ip() > 0x100000 && machine.cpu.mode == kokoa86_cpu::CpuMode::ProtectedMode {
+            output.push_str(&format!(
+                "\n!!! EIP out of range: CS={:04X} IP={:08X} linear={:08X} after {} instructions\n",
+                cs, ip, machine.cpu.cs_ip(), i
+            ));
+            break;
+        }
+        // Trace last 20 instructions before breakout
+        if i >= 427830 && i < 427850 {
+            let inst = decode::decode(&machine.cpu, &machine.mem);
+            let linear = machine.cpu.cs_ip();
+            let mut bytes = String::new();
+            for j in 0..inst.len.min(10) as u32 {
+                bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(linear + j)));
+            }
+            output.push_str(&format!(
+                "TRACE {:5}: {:04X}:{:08X}  {:<30} {:?}\n",
+                i, cs, ip, bytes.trim(), inst.op
+            ));
+        }
 
         // Detect infinite loops
         if (cs, ip) == last_cs_ip {
