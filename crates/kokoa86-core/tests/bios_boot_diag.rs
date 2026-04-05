@@ -13,12 +13,53 @@ fn diag_seabios_boot() {
         }
     };
 
-    let mut machine = Machine::new(1024 * 1024); // 1MB RAM
+    let mut machine = Machine::new(16 * 1024 * 1024); // 16MB RAM
     machine.ports.register(Box::new(Serial8250::new_capture(0x3F8)));
     machine.load_bios(bios_data);
 
-    let report = kokoa86_core::diag::trace_boot(&mut machine, 2_000_000, 50);
+    let report = kokoa86_core::diag::trace_boot(&mut machine, 50_000_000, 50);
     println!("{}", report);
+
+    // Check serial output
+    // The serial device is behind Box<dyn PortDevice>, can't access directly.
+    // Instead, check what was written by reading from machine state.
+
+    // Dump some info about the halt location
+    println!("\n=== Halt analysis ===");
+    let halt_addr = machine.cpu.eip;
+    // Check the 50 bytes before halt for string data
+    let str_addr = machine.cpu.get_reg32(0); // EAX often has format string ptr
+    println!("EAX (possible string ptr): 0x{:08X}", str_addr);
+    if str_addr > 0 && str_addr < 0x100000 {
+        let mut s = Vec::new();
+        for j in 0..80 {
+            let b = machine.mem.read_u8(str_addr + j);
+            if b == 0 { break; }
+            s.push(b);
+        }
+        println!("String at EAX: {:?}", String::from_utf8_lossy(&s));
+    }
+    // Check EDX which was the 2nd param
+    let edx = machine.cpu.get_reg32(2);
+    println!("EDX (2nd param): 0x{:08X}", edx);
+
+    // Dump stack (return addresses)
+    println!("\nStack dump:");
+    let sp = machine.cpu.esp;
+    for j in 0..16 {
+        let addr = sp + j * 4;
+        let val = machine.mem.read_u32(addr);
+        println!("  ESP+{:02X}: {:08X}", j*4, val);
+    }
+    if edx > 0 && edx < 0x100000 {
+        let mut s = Vec::new();
+        for j in 0..80 {
+            let b = machine.mem.read_u8(edx + j);
+            if b == 0 { break; }
+            s.push(b);
+        }
+        println!("String at EDX: {:?}", String::from_utf8_lossy(&s));
+    }
 
     // Verify ROM is readable at the expected address
     println!("\n=== ROM verification ===");

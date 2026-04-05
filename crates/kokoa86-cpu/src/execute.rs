@@ -33,8 +33,11 @@ pub fn execute(
     let is32 = inst.operand_size == OperandSize::Dword32;
     let width: u8 = if is32 { 32 } else { 16 };
 
+    // Use CS.D bit to determine EIP width (NOT operand size prefix)
+    let eip_32bit = cpu.cs_cache.big || cpu.mode == crate::regs::CpuMode::ProtectedMode;
+
     // Compute next IP (after this instruction)
-    let next_ip = if is32 {
+    let next_ip = if eip_32bit {
         cpu.eip.wrapping_add(inst.len as u32)
     } else {
         (cpu.eip as u16).wrapping_add(inst.len as u16) as u32
@@ -279,11 +282,11 @@ pub fn execute(
         // === Control flow ===
         Opcode::JmpShort(disp) => {
             cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
-            if !is32 { cpu.eip &= 0xFFFF; }
+            if !eip_32bit { cpu.eip &= 0xFFFF; }
         }
         Opcode::JmpNearRel(disp) => {
             cpu.eip = next_ip.wrapping_add(*disp as u32);
-            if !is32 { cpu.eip &= 0xFFFF; }
+            if !eip_32bit { cpu.eip &= 0xFFFF; }
         }
         Opcode::JmpFar(seg, offset) => {
             crate::descriptor::load_segment(cpu, mem, 1, *seg); // CS = index 1
@@ -292,7 +295,7 @@ pub fn execute(
         Opcode::Jcc(cc, disp) => {
             if check_condition(cpu, *cc) {
                 cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
-                if !is32 { cpu.eip &= 0xFFFF; }
+                if !eip_32bit { cpu.eip &= 0xFFFF; }
             } else {
                 cpu.eip = next_ip;
             }
@@ -300,7 +303,7 @@ pub fn execute(
         Opcode::JccNear(cc, disp) => {
             if check_condition(cpu, *cc) {
                 cpu.eip = next_ip.wrapping_add(*disp as u32);
-                if !is32 { cpu.eip &= 0xFFFF; }
+                if !eip_32bit { cpu.eip &= 0xFFFF; }
             } else {
                 cpu.eip = next_ip;
             }
@@ -308,7 +311,7 @@ pub fn execute(
         Opcode::CallNearRel(disp) => {
             pushv(cpu, mem, next_ip, is32);
             cpu.eip = next_ip.wrapping_add(*disp as u32);
-            if !is32 { cpu.eip &= 0xFFFF; }
+            if !eip_32bit { cpu.eip &= 0xFFFF; }
         }
         Opcode::CallFar(seg, offset) => {
             pushv(cpu, mem, cpu.cs as u32, is32);
@@ -347,7 +350,7 @@ pub fn execute(
             cpu.set_reg16(1, cx);
             if cx != 0 {
                 cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
-                if !is32 { cpu.eip &= 0xFFFF; }
+                if !eip_32bit { cpu.eip &= 0xFFFF; }
             } else { cpu.eip = next_ip; }
         }
         Opcode::Loope(disp) => {
@@ -355,7 +358,7 @@ pub fn execute(
             cpu.set_reg16(1, cx);
             if cx != 0 && get_flag(cpu, FLAG_ZF) {
                 cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
-                if !is32 { cpu.eip &= 0xFFFF; }
+                if !eip_32bit { cpu.eip &= 0xFFFF; }
             } else { cpu.eip = next_ip; }
         }
         Opcode::Loopne(disp) => {
@@ -363,7 +366,7 @@ pub fn execute(
             cpu.set_reg16(1, cx);
             if cx != 0 && !get_flag(cpu, FLAG_ZF) {
                 cpu.eip = next_ip.wrapping_add(*disp as i32 as u32);
-                if !is32 { cpu.eip &= 0xFFFF; }
+                if !eip_32bit { cpu.eip &= 0xFFFF; }
             } else { cpu.eip = next_ip; }
         }
 

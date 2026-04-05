@@ -27,16 +27,26 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
         last_ips.push((cs, ip));
         if last_ips.len() > 20 { last_ips.remove(0); }
 
-        // Detect EIP going out of reasonable range
-        if machine.cpu.cs_ip() > 0x100000 && machine.cpu.mode == kokoa86_cpu::CpuMode::ProtectedMode {
+        // Detect when we start executing from data (all 00 bytes = suspicious)
+        let linear = machine.cpu.cs_ip();
+        let byte0 = machine.mem.read_u8(linear);
+        let byte1 = machine.mem.read_u8(linear + 1);
+        if byte0 == 0x00 && byte1 == 0x00 && i > 40 {
+            // Trace the last 20 instructions
             output.push_str(&format!(
-                "\n!!! EIP out of range: CS={:04X} IP={:08X} linear={:08X} after {} instructions\n",
-                cs, ip, machine.cpu.cs_ip(), i
+                "\n!!! Executing 00 00 (data?) at {:04X}:{:08X} (linear {:08X}) after {} instructions\n",
+                cs, ip, linear, i
             ));
+            output.push_str("Last 20 IPs:\n");
+            for (cs2, ip2) in &last_ips {
+                let lin2 = if *cs2 == 0xF000 { ((*cs2 as u32) << 4) + *ip2 } else { machine.cpu.cs_cache.base + *ip2 };
+                let b = machine.mem.read_u8(lin2);
+                output.push_str(&format!("  {:04X}:{:08X} (lin {:08X}) byte={:02X}\n", cs2, ip2, lin2, b));
+            }
             break;
         }
-        // Trace last 20 instructions before breakout
-        if i >= 427830 && i < 427850 {
+        // Trace normally
+        if i >= 19610 && i < 19640 {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();
             let mut bytes = String::new();
