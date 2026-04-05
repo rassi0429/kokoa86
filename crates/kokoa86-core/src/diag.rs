@@ -48,7 +48,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
         // Trace normally
         // Trace qemu_preinit and nearby
         let lip = machine.cpu.cs_ip();
-        if i == 200_000 {
+        if i >= 200_000 && i < 200_050 {
             output.push_str(&format!("LOOP STATE: EAX={:08X} EBX={:08X} ESI={:08X} EDI={:08X}\n",
                 machine.cpu.eax, machine.cpu.ebx, machine.cpu.esi, machine.cpu.edi));
             // Follow the linked list from EAX (node->next at [+0x00])
@@ -75,7 +75,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
                 addr += inst.len as u32;
             }
         }
-        if false {
+        if i >= 200_000 && i < 200_020 {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();
             let mut bytes = String::new();
@@ -83,8 +83,10 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
                 bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(linear + j)));
             }
             output.push_str(&format!(
-                "TRACE {:5}: {:04X}:{:08X}  {:<30} {:?}  EAX={:08X} EDX={:08X}\n",
-                i, cs, ip, bytes.trim(), inst.op, machine.cpu.eax, machine.cpu.edx
+                "T{:6}: {:<24} {:?}  A={:08X} B={:08X} C={:08X} D={:08X} SI={:08X} DI={:08X} BP={:08X} FL={:08X}\n",
+                i, bytes.trim(), inst.op,
+                machine.cpu.eax, machine.cpu.ebx, machine.cpu.ecx, machine.cpu.edx,
+                machine.cpu.esi, machine.cpu.edi, machine.cpu.ebp, machine.cpu.eflags
             ));
             // After instruction 37 (CALL), dump stack
             if i == 37 {
