@@ -86,7 +86,7 @@ impl PciBus {
         isa[0x04] = 0x07; isa[0x05] = 0x00; // Command
         isa[0x0A] = 0x01;                     // Subclass: ISA bridge
         isa[0x0B] = 0x06;                     // Class: Bridge
-        isa[0x0E] = 0x80;                     // Header type: multi-function
+        isa[0x0E] = 0x00;                     // Header type: normal (no other functions)
         self.register_device(0, 1, 0, isa);
 
         self
@@ -157,7 +157,29 @@ impl PortDevice for PciBus {
                         }
                     }
                 } else {
-                    0xFFFF_FFFF
+                    // Empty PCI slot: return 0xFF for most bytes,
+                    // but header_type byte (0x0E) = 0x00 (non-multi-function)
+                    // to prevent pci_next infinite loop on empty multi-function slots
+                    let abs_offset = register as usize + byte_offset as usize;
+                    match size {
+                        1 => {
+                            if abs_offset == 0x0E { 0x00 } else { 0xFF }
+                        }
+                        2 => {
+                            let b0 = if abs_offset == 0x0E { 0x00u8 } else { 0xFF };
+                            let b1 = if abs_offset + 1 == 0x0E { 0x00u8 } else { 0xFF };
+                            u16::from_le_bytes([b0, b1]) as u32
+                        }
+                        _ => {
+                            let mut bytes = [0xFFu8; 4];
+                            for k in 0..4 {
+                                if register as usize + k == 0x0E {
+                                    bytes[k] = 0x00;
+                                }
+                            }
+                            u32::from_le_bytes(bytes)
+                        }
+                    }
                 }
             }
             _ => 0xFFFF_FFFF,
@@ -279,5 +301,23 @@ mod test_extra {
         assert_eq!(vendor, 0x8086, "vendor");
         let device = pci.port_in(0xCFE, 2);
         assert_eq!(device, 0x7000, "device ID via port 0xCFE");
+    }
+}
+
+#[cfg(test)]
+mod test_empty {
+    use super::*;
+    #[test]
+    fn test_empty_slot_header_type() {
+        let mut pci = PciBus::new().with_default_devices();
+        // Select empty device 2, register 0x0C
+        pci.port_out(0xCF8, 4, 0x80001000 | 0x0C);
+        // Read byte at offset 0x0E (port 0xCFC + 2 = 0xCFE)
+        let ht = pci.port_in(0xCFE, 1);
+        assert_eq!(ht, 0x00, "empty slot header_type should be 0x00 (non-multi)");
+        // Read dword at register 0x0C
+        pci.port_out(0xCF8, 4, 0x80001000 | 0x0C);
+        let dw = pci.port_in(0xCFC, 4);
+        assert_eq!((dw >> 16) & 0xFF, 0x00, "header_type byte in dword should be 0x00");
     }
 }

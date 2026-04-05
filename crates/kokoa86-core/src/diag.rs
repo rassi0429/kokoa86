@@ -26,7 +26,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
         // Trace the caller of alloc #6 (the 3rd pci_device alloc)
         // alloc #5 is size=32 at inst ~73411
         // Trace 700 instructions from inst 73411 to see the full iteration
-        if alloc_count == 5 && lip == 0x0FFAD462 {
+        if false && alloc_count == 5 && lip == 0x0FFAD462 {
             output.push_str(&format!("\n=== Tracing iteration around alloc #5 (inst {}) ===\n", i));
             // Trace backwards is impossible, so trace forward 700 inst
             for j in 0..1200u64 {
