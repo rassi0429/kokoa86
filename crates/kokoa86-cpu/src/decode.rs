@@ -165,6 +165,42 @@ pub enum Opcode {
     // ENTER
     Enter(u16, u8), // 0xC8: size, nesting
 
+    // CPUID / cache / TSC / MSR
+    Cpuid,           // 0x0F A2
+    Wbinvd,          // 0x0F 09
+    Invd,            // 0x0F 08
+    Rdtsc,           // 0x0F 31
+    Rdmsr,           // 0x0F 32
+    Wrmsr,           // 0x0F 30
+
+    // Port string I/O
+    Insb,            // 0x6C
+    Insv,            // 0x6D
+    Outsb,           // 0x6E
+    Outsv,           // 0x6F
+
+    // Bit scan
+    Bsf(u8, ModrmOperand, u8),    // 0x0F BC
+    Bsr(u8, ModrmOperand, u8),    // 0x0F BD
+
+    // Bit test
+    BtRmReg(u8, ModrmOperand, u8),   // 0x0F A3
+    BtsRmReg(u8, ModrmOperand, u8),  // 0x0F AB
+    BtrRmReg(u8, ModrmOperand, u8),  // 0x0F B3
+    BtcRmReg(u8, ModrmOperand, u8),  // 0x0F BB
+    BtGroup(u8, ModrmOperand, u8, u8), // 0x0F BA /4-7 with imm8
+
+    // BSWAP
+    Bswap(u8),       // 0x0F C8+r
+
+    // XADD
+    XaddRm8(u8, ModrmOperand, u8),   // 0x0F C0
+    XaddRmv(u8, ModrmOperand, u8),   // 0x0F C1
+
+    // CMPXCHG
+    CmpxchgRm8(u8, ModrmOperand, u8),  // 0x0F B0
+    CmpxchgRmv(u8, ModrmOperand, u8),  // 0x0F B1
+
     Unknown(u8),
 }
 
@@ -423,6 +459,12 @@ fn decode_opcode(
             let imm = fetch8(*pos) as i8; *pos += 1;
             Opcode::ImulRegRmvImm8(reg, rm, bytes, imm)
         }
+
+        // INS/OUTS port string I/O
+        0x6C => Opcode::Insb,
+        0x6D => Opcode::Insv,
+        0x6E => Opcode::Outsb,
+        0x6F => Opcode::Outsv,
 
         // Jcc short
         0x70..=0x7F => {
@@ -821,6 +863,55 @@ fn decode_0f(
             Opcode::ImulRegRmv(reg, rm, bytes)
         }
 
+        // INVD
+        0x08 => Opcode::Invd,
+        // WBINVD
+        0x09 => Opcode::Wbinvd,
+
+        // WRMSR
+        0x30 => Opcode::Wrmsr,
+        // RDTSC
+        0x31 => Opcode::Rdtsc,
+        // RDMSR
+        0x32 => Opcode::Rdmsr,
+
+        // CPUID
+        0xA2 => Opcode::Cpuid,
+
+        // BT r/m, reg
+        0xA3 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::BtRmReg(reg, rm, bytes)
+        }
+
+        // BTS r/m, reg
+        0xAB => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::BtsRmReg(reg, rm, bytes)
+        }
+
+        // CMPXCHG r/m8, r8
+        0xB0 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::CmpxchgRm8(reg, rm, bytes)
+        }
+        // CMPXCHG r/mv, rv
+        0xB1 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::CmpxchgRmv(reg, rm, bytes)
+        }
+
+        // BTR r/m, reg
+        0xB3 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::BtrRmReg(reg, rm, bytes)
+        }
+
         // MOVZX r, r/m8
         0xB6 => {
             let (reg, rm, bytes) = modrm(pos);
@@ -845,6 +936,50 @@ fn decode_0f(
             *pos += bytes as u32;
             Opcode::MovsxWord(reg, rm, bytes)
         }
+
+        // BT group: 0F BA /4-7 with imm8
+        0xBA => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            let imm = fetch8(*pos); *pos += 1;
+            Opcode::BtGroup(reg, rm, bytes, imm)
+        }
+
+        // BTC r/m, reg
+        0xBB => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::BtcRmReg(reg, rm, bytes)
+        }
+
+        // BSF
+        0xBC => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Bsf(reg, rm, bytes)
+        }
+        // BSR
+        0xBD => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Bsr(reg, rm, bytes)
+        }
+
+        // XADD r/m8, r8
+        0xC0 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::XaddRm8(reg, rm, bytes)
+        }
+        // XADD r/mv, rv
+        0xC1 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::XaddRmv(reg, rm, bytes)
+        }
+
+        // BSWAP r32
+        0xC8..=0xCF => Opcode::Bswap(second - 0xC8),
 
         _ => Opcode::Unknown(second),
     }

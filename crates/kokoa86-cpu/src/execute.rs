@@ -996,6 +996,235 @@ pub fn execute(
         Opcode::Stc => { set_flag(cpu, FLAG_CF, true); cpu.eip = next_ip; }
         Opcode::Cmc => { let cf = get_flag(cpu, FLAG_CF); set_flag(cpu, FLAG_CF, !cf); cpu.eip = next_ip; }
 
+        // === CPUID ===
+        Opcode::Cpuid => {
+            match cpu.eax {
+                0 => {
+                    cpu.eax = 1; // max leaf
+                    // "kokoa86!x86E" = EBX:EDX:ECX
+                    cpu.ebx = u32::from_le_bytes(*b"koko");
+                    cpu.edx = u32::from_le_bytes(*b"a86!");
+                    cpu.ecx = u32::from_le_bytes(*b"x86E");
+                }
+                1 => {
+                    cpu.eax = 0x00000600; // family 6
+                    cpu.ebx = 0;
+                    cpu.ecx = 0;
+                    cpu.edx = 0x00008011; // FPU + PSE + TSC + CMOV
+                }
+                _ => {
+                    cpu.eax = 0;
+                    cpu.ebx = 0;
+                    cpu.ecx = 0;
+                    cpu.edx = 0;
+                }
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === WBINVD / INVD ===
+        Opcode::Wbinvd | Opcode::Invd => {
+            cpu.eip = next_ip;
+        }
+
+        // === RDTSC (stub) ===
+        Opcode::Rdtsc => {
+            cpu.eax = 0;
+            cpu.edx = 0;
+            cpu.eip = next_ip;
+        }
+
+        // === RDMSR / WRMSR (no-op stubs) ===
+        Opcode::Rdmsr | Opcode::Wrmsr => {
+            cpu.eip = next_ip;
+        }
+
+        // === INSB ===
+        Opcode::Insb => {
+            let port = cpu.get_reg16(2);
+            let val = ports.port_in(port, 1);
+            let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+            mem.write_u8(addr, val as u8);
+            let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
+            cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+            cpu.eip = next_ip;
+        }
+        // === INSV ===
+        Opcode::Insv => {
+            let port = cpu.get_reg16(2);
+            let addr = cpu.linear_addr(cpu.es, cpu.get_reg16(7));
+            if is32 {
+                let val = ports.port_in(port, 4);
+                mem.write_u32(addr, val);
+                let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
+                cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+            } else {
+                let val = ports.port_in(port, 2);
+                mem.write_u16(addr, val as u16);
+                let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
+                cpu.set_reg16(7, cpu.get_reg16(7).wrapping_add(d));
+            }
+            cpu.eip = next_ip;
+        }
+        // === OUTSB ===
+        Opcode::Outsb => {
+            let port = cpu.get_reg16(2);
+            let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+            let val = mem.read_u8(addr) as u32;
+            ports.port_out(port, 1, val);
+            let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFF } else { 1 };
+            cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+            cpu.eip = next_ip;
+        }
+        // === OUTSV ===
+        Opcode::Outsv => {
+            let port = cpu.get_reg16(2);
+            let addr = cpu.linear_addr(cpu.ds, cpu.get_reg16(6));
+            if is32 {
+                let val = mem.read_u32(addr);
+                ports.port_out(port, 4, val);
+                let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFC } else { 4 };
+                cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+            } else {
+                let val = mem.read_u16(addr) as u32;
+                ports.port_out(port, 2, val);
+                let d: u16 = if get_flag(cpu, FLAG_DF) { 0xFFFE } else { 2 };
+                cpu.set_reg16(6, cpu.get_reg16(6).wrapping_add(d));
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === BSF ===
+        Opcode::Bsf(reg, rm, _) => {
+            let src = read_rmv(cpu, mem, rm, is32);
+            if src == 0 {
+                set_flag(cpu, FLAG_ZF, true);
+            } else {
+                set_flag(cpu, FLAG_ZF, false);
+                let bit = src.trailing_zeros();
+                if is32 { cpu.set_reg32(*reg, bit); } else { cpu.set_reg16(*reg, bit as u16); }
+            }
+            cpu.eip = next_ip;
+        }
+        // === BSR ===
+        Opcode::Bsr(reg, rm, _) => {
+            let src = read_rmv(cpu, mem, rm, is32);
+            if src == 0 {
+                set_flag(cpu, FLAG_ZF, true);
+            } else {
+                set_flag(cpu, FLAG_ZF, false);
+                let bit = 31 - src.leading_zeros();
+                if is32 { cpu.set_reg32(*reg, bit); } else { cpu.set_reg16(*reg, bit as u16); }
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === BT r/m, reg ===
+        Opcode::BtRmReg(reg, rm, _) => {
+            let src = read_rmv(cpu, mem, rm, is32);
+            let bit = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let bit_pos = bit & (width as u32 - 1);
+            set_flag(cpu, FLAG_CF, (src >> bit_pos) & 1 != 0);
+            cpu.eip = next_ip;
+        }
+        // === BTS r/m, reg ===
+        Opcode::BtsRmReg(reg, rm, _) => {
+            let src = read_rmv(cpu, mem, rm, is32);
+            let bit = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let bit_pos = bit & (width as u32 - 1);
+            set_flag(cpu, FLAG_CF, (src >> bit_pos) & 1 != 0);
+            write_rmv(cpu, mem, rm, src | (1 << bit_pos), is32);
+            cpu.eip = next_ip;
+        }
+        // === BTR r/m, reg ===
+        Opcode::BtrRmReg(reg, rm, _) => {
+            let src = read_rmv(cpu, mem, rm, is32);
+            let bit = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let bit_pos = bit & (width as u32 - 1);
+            set_flag(cpu, FLAG_CF, (src >> bit_pos) & 1 != 0);
+            write_rmv(cpu, mem, rm, src & !(1 << bit_pos), is32);
+            cpu.eip = next_ip;
+        }
+        // === BTC r/m, reg ===
+        Opcode::BtcRmReg(reg, rm, _) => {
+            let src = read_rmv(cpu, mem, rm, is32);
+            let bit = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let bit_pos = bit & (width as u32 - 1);
+            set_flag(cpu, FLAG_CF, (src >> bit_pos) & 1 != 0);
+            write_rmv(cpu, mem, rm, src ^ (1 << bit_pos), is32);
+            cpu.eip = next_ip;
+        }
+        // === BT group (0F BA) with imm8 ===
+        Opcode::BtGroup(sub, rm, _, imm) => {
+            let src = read_rmv(cpu, mem, rm, is32);
+            let bit_pos = (*imm as u32) & (width as u32 - 1);
+            set_flag(cpu, FLAG_CF, (src >> bit_pos) & 1 != 0);
+            match sub {
+                4 => {} // BT - just test
+                5 => { write_rmv(cpu, mem, rm, src | (1 << bit_pos), is32); }  // BTS
+                6 => { write_rmv(cpu, mem, rm, src & !(1 << bit_pos), is32); } // BTR
+                7 => { write_rmv(cpu, mem, rm, src ^ (1 << bit_pos), is32); }  // BTC
+                _ => log::warn!("Unimplemented BT group sub-op: {}", sub),
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === BSWAP ===
+        Opcode::Bswap(reg) => {
+            let val = cpu.get_reg32(*reg);
+            cpu.set_reg32(*reg, val.swap_bytes());
+            cpu.eip = next_ip;
+        }
+
+        // === XADD r/m8, r8 ===
+        Opcode::XaddRm8(reg, rm, _) => {
+            let dst_val = read_rm8(cpu, mem, rm) as u32;
+            let src_val = cpu.get_reg8(*reg) as u32;
+            let result = dst_val.wrapping_add(src_val);
+            update_flags_add(cpu, dst_val, src_val, result as u64, 8);
+            cpu.set_reg8(*reg, dst_val as u8);
+            write_rm8(cpu, mem, rm, result as u8);
+            cpu.eip = next_ip;
+        }
+        // === XADD r/mv, rv ===
+        Opcode::XaddRmv(reg, rm, _) => {
+            let dst_val = read_rmv(cpu, mem, rm, is32);
+            let src_val = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+            let result = dst_val.wrapping_add(src_val);
+            update_flags_add(cpu, dst_val, src_val, result as u64, width);
+            if is32 { cpu.set_reg32(*reg, dst_val); } else { cpu.set_reg16(*reg, dst_val as u16); }
+            write_rmv(cpu, mem, rm, result, is32);
+            cpu.eip = next_ip;
+        }
+
+        // === CMPXCHG r/m8, r8 ===
+        Opcode::CmpxchgRm8(reg, rm, _) => {
+            let dst_val = read_rm8(cpu, mem, rm);
+            let al = cpu.get_reg8(0);
+            if al == dst_val {
+                set_flag(cpu, FLAG_ZF, true);
+                write_rm8(cpu, mem, rm, cpu.get_reg8(*reg));
+            } else {
+                set_flag(cpu, FLAG_ZF, false);
+                cpu.set_reg8(0, dst_val);
+            }
+            cpu.eip = next_ip;
+        }
+        // === CMPXCHG r/mv, rv ===
+        Opcode::CmpxchgRmv(reg, rm, _) => {
+            let dst_val = read_rmv(cpu, mem, rm, is32);
+            let acc = if is32 { cpu.get_reg32(0) } else { cpu.get_reg16(0) as u32 };
+            if acc == dst_val {
+                set_flag(cpu, FLAG_ZF, true);
+                let src = if is32 { cpu.get_reg32(*reg) } else { cpu.get_reg16(*reg) as u32 };
+                write_rmv(cpu, mem, rm, src, is32);
+            } else {
+                set_flag(cpu, FLAG_ZF, false);
+                if is32 { cpu.set_reg32(0, dst_val); } else { cpu.set_reg16(0, dst_val as u16); }
+            }
+            cpu.eip = next_ip;
+        }
+
         Opcode::Unknown(byte) => {
             log::error!("Unknown opcode: 0x{:02X} at {:04X}:{:04X}", byte, cpu.cs, cpu.eip);
             return ExecResult::UnknownOpcode(*byte);
