@@ -13,12 +13,12 @@ fn diag_seabios_boot() {
         }
     };
 
-    let mut machine = Machine::new(256 * 1024 * 1024); // 256MB RAM
+    let mut machine = Machine::new(512 * 1024 * 1024); // 512MB RAM
     let serial = Serial8250::new_capture(0x3F8);
     machine.ports.register(Box::new(serial));
     machine.load_bios(bios_data);
 
-    let report = kokoa86_core::diag::trace_boot(&mut machine, 500_000_000, 50);
+    let report = kokoa86_core::diag::trace_boot(&mut machine, 2_000_000_000, 50);
     println!("{}", report);
 
     // Serial output from SeaBIOS

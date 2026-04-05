@@ -21,7 +21,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
             last_serial_len = machine.serial_output.len();
         }
 
-        if lip == 0x0FFAD462 { alloc_count += 1; }
+        // alloc tracking disabled — address changes with relocation
 
         // Trace the caller of alloc #6 (the 3rd pci_device alloc)
         // alloc #5 is size=32 at inst ~73411

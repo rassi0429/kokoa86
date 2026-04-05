@@ -278,19 +278,7 @@ impl PortIo for DevicePortAdapter<'_> {
             0x40..=0x43 => { self.pit.port_out(port, size, val); return; }
             0x60 | 0x64 => { self.ps2.port_out(port, size, val); return; }
             0x70..=0x71 => { self.cmos.port_out(port, size, val); return; }
-            0xCF8..=0xCFF => {
-                // Log vendor read setup (register 0)
-                if port == 0xCF8 && val & 0xFF == 0 && val & 0x80000000 != 0 {
-                    let bdf = (val >> 8) & 0xFFFF;
-                    let bus = (bdf >> 8) & 0xFF;
-                    let dev = (bdf >> 3) & 0x1F;
-                    let func = bdf & 0x07;
-                    if bus == 0 && (dev > 1 || func > 0) {
-                        eprintln!("PCI_VENDOR_SCAN bus={} dev={} fn={}", bus, dev, func);
-                    }
-                }
-                self.pci.port_out(port, size, val); return;
-            }
+            0xCF8..=0xCFF => { self.pci.port_out(port, size, val); return; }
             0x1F0..=0x1F7 | 0x3F6 => { self.ata.port_out(port, size, val); return; }
             0x3C0..=0x3CF | 0x3D4..=0x3DA => { self.vga.port_out(port, val as u8); return; }
             _ => {}
