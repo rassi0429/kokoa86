@@ -48,6 +48,33 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
         // Trace normally
         // Trace qemu_preinit and nearby
         let lip = machine.cpu.cs_ip();
+        if i == 200_000 {
+            output.push_str(&format!("LOOP STATE: EAX={:08X} EBX={:08X} ESI={:08X} EDI={:08X}\n",
+                machine.cpu.eax, machine.cpu.ebx, machine.cpu.esi, machine.cpu.edi));
+            // Follow the linked list from EAX (node->next at [+0x00])
+            let mut ptr = machine.cpu.eax;
+            for j in 0..200 {
+                if ptr == 0 { break; }
+                let next = machine.mem.read_u32(ptr); // [+0x00] = next ptr
+                output.push_str(&format!("  node[{}]: ptr={:08X} [+00]={:08X} [+04]={:08X} [+08]={:08X} [+0C]={:08X} [+10]={:08X}\n",
+                    j, ptr, next, machine.mem.read_u32(ptr+4), machine.mem.read_u32(ptr+8),
+                    machine.mem.read_u32(ptr+0xC), machine.mem.read_u32(ptr+0x10)));
+                if next == ptr { output.push_str("  !!! SELF-LOOP\n"); break; }
+                ptr = next;
+            }
+            // Dump the loop code
+            output.push_str(&format!("\n=== Loop code at {:08X} ===\n", machine.cpu.cs_ip()));
+            let mut addr = 0x07FAD460u32;
+            for _ in 0..30 {
+                let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, addr);
+                let mut bytes = String::new();
+                for j in 0..inst.len.min(8) as u32 {
+                    bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(addr + j)));
+                }
+                output.push_str(&format!("  {:08X}  {:<24} {:?}\n", addr, bytes.trim(), inst.op));
+                addr += inst.len as u32;
+            }
+        }
         if false {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();

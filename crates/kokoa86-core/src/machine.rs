@@ -98,10 +98,10 @@ impl Machine {
             return Ok(ExecResult::Halt);
         }
 
-        // Tick PIT (roughly 1 PIT tick per ~10 CPU instructions)
-        if self.instruction_count % 10 == 0 {
-            self.pit.tick(1);
-        }
+        // Tick PIT — each x86 instruction ≈ several clock cycles
+        // PIT base clock is 1.193182 MHz, typical CPU at ~100 MIPS
+        // So ~100 PIT ticks per instruction is a rough approximation
+        self.pit.tick(100);
 
         // Check device IRQs and feed to PIC
         if self.pit.check_irq0() {
