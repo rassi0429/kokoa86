@@ -13,7 +13,7 @@ fn diag_seabios_boot() {
         }
     };
 
-    let mut machine = Machine::new(1024 * 1024 * 1024); // 1GB RAM
+    let mut machine = Machine::new(2u64 as usize * 1024 * 1024 * 1024); // 2GB RAM
     let serial = Serial8250::new_capture(0x3F8);
     machine.ports.register(Box::new(serial));
     machine.load_bios(bios_data);
