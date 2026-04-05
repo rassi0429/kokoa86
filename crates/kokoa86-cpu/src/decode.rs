@@ -201,6 +201,39 @@ pub enum Opcode {
     CmpxchgRm8(u8, ModrmOperand, u8),  // 0x0F B0
     CmpxchgRmv(u8, ModrmOperand, u8),  // 0x0F B1
 
+    // BCD/ASCII adjust
+    Aad(u8),    // 0xD5 imm8
+    Aam(u8),    // 0xD4 imm8
+    Daa,        // 0x27
+    Das,        // 0x2F
+    Aaa,        // 0x37
+    Aas,        // 0x3F
+
+    // XLAT
+    Xlat,       // 0xD7
+
+    // PUSHA/POPA
+    Pusha,      // 0x60
+    Popa,       // 0x61
+
+    // BOUND (decode + skip)
+    Bound(u8, ModrmOperand, u8),  // 0x62
+    // ARPL
+    Arpl(u8, ModrmOperand, u8),   // 0x63
+
+    // LES/LDS
+    Les(u8, ModrmOperand, u8),    // 0xC4
+    Lds(u8, ModrmOperand, u8),    // 0xC5
+
+    // INT 3 / INTO
+    Int3,       // 0xCC
+    Into,       // 0xCE
+
+    // 0x0F extended
+    Lar(u8, ModrmOperand, u8),    // 0x0F 02
+    Lsl(u8, ModrmOperand, u8),    // 0x0F 03
+    Clts,                          // 0x0F 06
+
     Unknown(u8),
 }
 
@@ -411,6 +444,15 @@ fn decode_opcode(
             Opcode::AluAxImmv(alu, imm)
         }
 
+        // DAA
+        0x27 => Opcode::Daa,
+        // DAS
+        0x2F => Opcode::Das,
+        // AAA
+        0x37 => Opcode::Aaa,
+        // AAS
+        0x3F => Opcode::Aas,
+
         // Segment override prefixes (shouldn't reach here after prefix loop, but handle)
         0x06 => { // PUSH ES
             Opcode::PushRegv(0) // handled specially in execute
@@ -434,6 +476,23 @@ fn decode_opcode(
         0x50..=0x57 => Opcode::PushRegv(opcode_byte - 0x50),
         // POP rv
         0x58..=0x5F => Opcode::PopRegv(opcode_byte - 0x58),
+
+        // PUSHA/PUSHAD
+        0x60 => Opcode::Pusha,
+        // POPA/POPAD
+        0x61 => Opcode::Popa,
+        // BOUND
+        0x62 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Bound(reg, rm, bytes)
+        }
+        // ARPL
+        0x63 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Arpl(reg, rm, bytes)
+        }
 
         // PUSH immv
         0x68 => {
@@ -640,6 +699,19 @@ fn decode_opcode(
         // RET
         0xC3 => Opcode::Ret,
 
+        // LES
+        0xC4 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Les(reg, rm, bytes)
+        }
+        // LDS
+        0xC5 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Lds(reg, rm, bytes)
+        }
+
         // MOV r/m8, imm8
         0xC6 => {
             let (_reg, rm, bytes) = modrm(pos);
@@ -668,8 +740,12 @@ fn decode_opcode(
         // RETF
         0xCB => Opcode::Retf,
 
+        // INT 3 (breakpoint)
+        0xCC => Opcode::Int3,
         // INT imm8
         0xCD => { let v = fetch8(*pos); *pos += 1; Opcode::Int(v) }
+        // INTO
+        0xCE => Opcode::Into,
         // IRET
         0xCF => Opcode::Iret,
 
@@ -697,6 +773,14 @@ fn decode_opcode(
             *pos += bytes as u32;
             Opcode::ShiftRmv(ShiftOp::from_reg(reg), rm, bytes, ShiftCount::CL)
         }
+
+        // AAM imm8
+        0xD4 => { let imm = fetch8(*pos); *pos += 1; Opcode::Aam(imm) }
+        // AAD imm8
+        0xD5 => { let imm = fetch8(*pos); *pos += 1; Opcode::Aad(imm) }
+
+        // XLAT/XLATB
+        0xD7 => Opcode::Xlat,
 
         // LOOPNE
         0xE0 => { let d = fetch8(*pos) as i8; *pos += 1; Opcode::Loopne(d) }
@@ -816,12 +900,28 @@ fn decode_0f(
     *pos += 1;
 
     match second {
-        // Group 7: SGDT/SIDT/LGDT/LIDT
+        // Group 7: SGDT/SIDT/LGDT/LIDT/SMSW/LMSW/INVLPG
         0x01 => {
             let (reg, rm, bytes) = modrm(pos);
             *pos += bytes as u32;
             Opcode::Group0F01(reg, rm, bytes)
         }
+
+        // LAR r, r/m
+        0x02 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Lar(reg, rm, bytes)
+        }
+        // LSL r, r/m
+        0x03 => {
+            let (reg, rm, bytes) = modrm(pos);
+            *pos += bytes as u32;
+            Opcode::Lsl(reg, rm, bytes)
+        }
+
+        // CLTS
+        0x06 => Opcode::Clts,
 
         // MOV r32, CRn
         0x20 => {

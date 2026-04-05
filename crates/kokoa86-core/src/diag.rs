@@ -24,7 +24,7 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
         // Detect infinite loops
         if (cs, ip) == last_cs_ip {
             loop_count += 1;
-            if loop_count > 1000 {
+            if loop_count > 100_000 {
                 output.push_str(&format!(
                     "\n!!! Infinite loop detected at {:04X}:{:04X} after {} instructions\n",
                     cs, ip, i
@@ -78,6 +78,24 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
                 output.push_str(&format!("\n!!! Error: {} after {} instructions\n", e, i));
                 break;
             }
+        }
+    }
+
+    // Dump 10 instructions at final IP
+    output.push_str("\n=== Instructions at final IP ===\n");
+    {
+        let mut addr = machine.cpu.cs_ip();
+        for _ in 0..10 {
+            let inst = decode::decode_at_addr(&machine.cpu, &machine.mem, addr);
+            let mut bytes = String::new();
+            for j in 0..inst.len.min(8) as u32 {
+                bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(addr + j)));
+            }
+            output.push_str(&format!(
+                "  {:08X}  {:<24} {:?}\n",
+                addr, bytes.trim(), inst.op
+            ));
+            addr += inst.len as u32;
         }
     }
 

@@ -836,6 +836,40 @@ pub fn execute(
                         mem.write_u32(*addr + 2, cpu.idtr.base);
                     }
                 }
+                4 => { // SMSW: store machine status word (CR0 low 16 bits)
+                    let val = (cpu.cr0 & 0xFFFF) as u16;
+                    match rm {
+                        ModrmOperand::Reg(idx) => {
+                            if is32 { cpu.set_reg32(*idx, val as u32); } else { cpu.set_reg16(*idx, val); }
+                        }
+                        ModrmOperand::Mem(addr) => {
+                            mem.write_u16(*addr, val);
+                        }
+                    }
+                }
+                6 => { // LMSW: load machine status word
+                    let val = match rm {
+                        ModrmOperand::Reg(idx) => cpu.get_reg16(*idx),
+                        ModrmOperand::Mem(addr) => mem.read_u16(*addr),
+                    };
+                    let old_pe = cpu.cr0 & 1;
+                    // LMSW cannot clear PE once set
+                    cpu.cr0 = (cpu.cr0 & 0xFFFF0000) | (val as u32);
+                    if old_pe == 1 {
+                        cpu.cr0 |= 1; // PE cannot be cleared by LMSW
+                    }
+                    let new_pe = cpu.cr0 & 1;
+                    if old_pe == 0 && new_pe == 1 {
+                        cpu.mode = crate::regs::CpuMode::ProtectedMode;
+                        cpu.cs_cache.base = (cpu.cs as u32) << 4;
+                        cpu.cs_cache.selector = cpu.cs;
+                        cpu.ds_cache.base = (cpu.ds as u32) << 4;
+                        cpu.es_cache.base = (cpu.es as u32) << 4;
+                        cpu.ss_cache.base = (cpu.ss as u32) << 4;
+                    }
+                }
+                7 => { // INVLPG: invalidate TLB entry (no-op for us)
+                }
                 _ => log::warn!("Unimplemented 0F01 sub-op: {}", sub),
             }
             cpu.eip = next_ip;
@@ -1230,6 +1264,266 @@ pub fn execute(
                 set_flag(cpu, FLAG_ZF, false);
                 if is32 { cpu.set_reg32(0, dst_val); } else { cpu.set_reg16(0, dst_val as u16); }
             }
+            cpu.eip = next_ip;
+        }
+
+        // === AAD ===
+        Opcode::Aad(imm) => {
+            let al = cpu.get_reg8(0);
+            let ah = cpu.get_reg8(4);
+            let result = ah.wrapping_mul(*imm).wrapping_add(al);
+            cpu.set_reg8(0, result); // AL
+            cpu.set_reg8(4, 0);      // AH = 0
+            update_flags_logic(cpu, result as u32, 8);
+            cpu.eip = next_ip;
+        }
+
+        // === AAM ===
+        Opcode::Aam(imm) => {
+            if *imm == 0 {
+                cpu.eip = next_ip;
+                return ExecResult::DivideError;
+            }
+            let al = cpu.get_reg8(0);
+            cpu.set_reg8(4, al / *imm);  // AH = AL / imm
+            cpu.set_reg8(0, al % *imm);  // AL = AL % imm
+            update_flags_logic(cpu, cpu.get_reg8(0) as u32, 8);
+            cpu.eip = next_ip;
+        }
+
+        // === DAA ===
+        Opcode::Daa => {
+            let old_al = cpu.get_reg8(0);
+            let old_cf = get_flag(cpu, FLAG_CF);
+            let old_af = get_flag(cpu, FLAG_AF);
+            set_flag(cpu, FLAG_CF, false);
+
+            if (old_al & 0x0F) > 9 || old_af {
+                let new_al = old_al.wrapping_add(6);
+                cpu.set_reg8(0, new_al);
+                set_flag(cpu, FLAG_CF, old_cf || old_al > 0xF9);
+                set_flag(cpu, FLAG_AF, true);
+            } else {
+                set_flag(cpu, FLAG_AF, false);
+            }
+
+            let al = cpu.get_reg8(0);
+            if al > 0x99 || old_cf {
+                cpu.set_reg8(0, al.wrapping_add(0x60));
+                set_flag(cpu, FLAG_CF, true);
+            }
+
+            let al = cpu.get_reg8(0);
+            set_flag(cpu, FLAG_SF, (al & 0x80) != 0);
+            set_flag(cpu, FLAG_ZF, al == 0);
+            set_flag(cpu, FLAG_PF, al.count_ones() % 2 == 0);
+            cpu.eip = next_ip;
+        }
+
+        // === DAS ===
+        Opcode::Das => {
+            let old_al = cpu.get_reg8(0);
+            let old_cf = get_flag(cpu, FLAG_CF);
+            let old_af = get_flag(cpu, FLAG_AF);
+            set_flag(cpu, FLAG_CF, false);
+
+            if (old_al & 0x0F) > 9 || old_af {
+                let new_al = old_al.wrapping_sub(6);
+                cpu.set_reg8(0, new_al);
+                set_flag(cpu, FLAG_CF, old_cf || old_al < 6);
+                set_flag(cpu, FLAG_AF, true);
+            } else {
+                set_flag(cpu, FLAG_AF, false);
+            }
+
+            let al = cpu.get_reg8(0);
+            if old_al > 0x99 || old_cf {
+                cpu.set_reg8(0, al.wrapping_sub(0x60));
+                set_flag(cpu, FLAG_CF, true);
+            }
+
+            let al = cpu.get_reg8(0);
+            set_flag(cpu, FLAG_SF, (al & 0x80) != 0);
+            set_flag(cpu, FLAG_ZF, al == 0);
+            set_flag(cpu, FLAG_PF, al.count_ones() % 2 == 0);
+            cpu.eip = next_ip;
+        }
+
+        // === AAA ===
+        Opcode::Aaa => {
+            let al = cpu.get_reg8(0);
+            let ah = cpu.get_reg8(4);
+            if (al & 0x0F) > 9 || get_flag(cpu, FLAG_AF) {
+                cpu.set_reg8(0, al.wrapping_add(6));
+                cpu.set_reg8(4, ah.wrapping_add(1));
+                set_flag(cpu, FLAG_AF, true);
+                set_flag(cpu, FLAG_CF, true);
+            } else {
+                set_flag(cpu, FLAG_AF, false);
+                set_flag(cpu, FLAG_CF, false);
+            }
+            cpu.set_reg8(0, cpu.get_reg8(0) & 0x0F);
+            cpu.eip = next_ip;
+        }
+
+        // === AAS ===
+        Opcode::Aas => {
+            let al = cpu.get_reg8(0);
+            let ah = cpu.get_reg8(4);
+            if (al & 0x0F) > 9 || get_flag(cpu, FLAG_AF) {
+                cpu.set_reg8(0, al.wrapping_sub(6));
+                cpu.set_reg8(4, ah.wrapping_sub(1));
+                set_flag(cpu, FLAG_AF, true);
+                set_flag(cpu, FLAG_CF, true);
+            } else {
+                set_flag(cpu, FLAG_AF, false);
+                set_flag(cpu, FLAG_CF, false);
+            }
+            cpu.set_reg8(0, cpu.get_reg8(0) & 0x0F);
+            cpu.eip = next_ip;
+        }
+
+        // === XLAT ===
+        Opcode::Xlat => {
+            let bx = cpu.get_reg16(3); // BX
+            let al = cpu.get_reg8(0) as u16;
+            let addr = cpu.linear_addr(cpu.ds, bx.wrapping_add(al));
+            cpu.set_reg8(0, mem.read_u8(addr));
+            cpu.eip = next_ip;
+        }
+
+        // === PUSHA/PUSHAD ===
+        Opcode::Pusha => {
+            let sp_val = if is32 { cpu.esp } else { cpu.get_reg16(4) as u32 };
+            if is32 {
+                push32(cpu, mem, cpu.eax);
+                push32(cpu, mem, cpu.ecx);
+                push32(cpu, mem, cpu.edx);
+                push32(cpu, mem, cpu.ebx);
+                push32(cpu, mem, sp_val);
+                push32(cpu, mem, cpu.ebp);
+                push32(cpu, mem, cpu.esi);
+                push32(cpu, mem, cpu.edi);
+            } else {
+                push16(cpu, mem, cpu.get_reg16(0)); // AX
+                push16(cpu, mem, cpu.get_reg16(1)); // CX
+                push16(cpu, mem, cpu.get_reg16(2)); // DX
+                push16(cpu, mem, cpu.get_reg16(3)); // BX
+                push16(cpu, mem, sp_val as u16);    // original SP
+                push16(cpu, mem, cpu.get_reg16(5)); // BP
+                push16(cpu, mem, cpu.get_reg16(6)); // SI
+                push16(cpu, mem, cpu.get_reg16(7)); // DI
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === POPA/POPAD ===
+        Opcode::Popa => {
+            if is32 {
+                cpu.edi = pop32(cpu, mem);
+                cpu.esi = pop32(cpu, mem);
+                cpu.ebp = pop32(cpu, mem);
+                let _skip_sp = pop32(cpu, mem);
+                cpu.ebx = pop32(cpu, mem);
+                cpu.edx = pop32(cpu, mem);
+                cpu.ecx = pop32(cpu, mem);
+                cpu.eax = pop32(cpu, mem);
+            } else {
+                let di = pop16(cpu, mem); cpu.set_reg16(7, di);
+                let si = pop16(cpu, mem); cpu.set_reg16(6, si);
+                let bp = pop16(cpu, mem); cpu.set_reg16(5, bp);
+                let _skip_sp = pop16(cpu, mem);
+                let bx = pop16(cpu, mem); cpu.set_reg16(3, bx);
+                let dx = pop16(cpu, mem); cpu.set_reg16(2, dx);
+                let cx = pop16(cpu, mem); cpu.set_reg16(1, cx);
+                let ax = pop16(cpu, mem); cpu.set_reg16(0, ax);
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === BOUND (just NOP - no bounds check) ===
+        Opcode::Bound(_reg, _rm, _) => {
+            cpu.eip = next_ip;
+        }
+
+        // === ARPL (NOP in real mode, stub in protected mode) ===
+        Opcode::Arpl(_reg, rm, _) => {
+            // In protected mode: adjust RPL of r/m to be >= RPL of reg
+            // For now, just set ZF=0 (no adjustment needed)
+            let _ = rm;
+            set_flag(cpu, FLAG_ZF, false);
+            cpu.eip = next_ip;
+        }
+
+        // === LES ===
+        Opcode::Les(reg, rm, _) => {
+            if let ModrmOperand::Mem(addr) = rm {
+                if is32 {
+                    let offset = mem.read_u32(*addr);
+                    let seg = mem.read_u16(*addr + 4);
+                    cpu.set_reg32(*reg, offset);
+                    crate::descriptor::load_segment(cpu, mem, 0, seg); // ES = index 0
+                } else {
+                    let offset = mem.read_u16(*addr);
+                    let seg = mem.read_u16(*addr + 2);
+                    cpu.set_reg16(*reg, offset);
+                    crate::descriptor::load_segment(cpu, mem, 0, seg);
+                }
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === LDS ===
+        Opcode::Lds(reg, rm, _) => {
+            if let ModrmOperand::Mem(addr) = rm {
+                if is32 {
+                    let offset = mem.read_u32(*addr);
+                    let seg = mem.read_u16(*addr + 4);
+                    cpu.set_reg32(*reg, offset);
+                    crate::descriptor::load_segment(cpu, mem, 3, seg); // DS = index 3
+                } else {
+                    let offset = mem.read_u16(*addr);
+                    let seg = mem.read_u16(*addr + 2);
+                    cpu.set_reg16(*reg, offset);
+                    crate::descriptor::load_segment(cpu, mem, 3, seg);
+                }
+            }
+            cpu.eip = next_ip;
+        }
+
+        // === INT 3 ===
+        Opcode::Int3 => {
+            cpu.eip = next_ip;
+            if !int_handler.handle_int(cpu, mem, 3) {
+                log::warn!("Unhandled INT 3 (breakpoint)");
+            }
+        }
+
+        // === INTO ===
+        Opcode::Into => {
+            cpu.eip = next_ip;
+            if get_flag(cpu, FLAG_OF) {
+                if !int_handler.handle_int(cpu, mem, 4) {
+                    log::warn!("Unhandled INTO (overflow)");
+                }
+            }
+        }
+
+        // === LAR (stub: ZF=0 means not accessible) ===
+        Opcode::Lar(_reg, _rm, _) => {
+            set_flag(cpu, FLAG_ZF, false);
+            cpu.eip = next_ip;
+        }
+
+        // === LSL (stub: ZF=0 means not accessible) ===
+        Opcode::Lsl(_reg, _rm, _) => {
+            set_flag(cpu, FLAG_ZF, false);
+            cpu.eip = next_ip;
+        }
+
+        // === CLTS ===
+        Opcode::Clts => {
+            cpu.cr0 &= !(1 << 3); // Clear TS (Task Switched) flag
             cpu.eip = next_ip;
         }
 
