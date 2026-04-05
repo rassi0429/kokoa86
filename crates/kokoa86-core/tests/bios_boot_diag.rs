@@ -48,6 +48,80 @@ fn diag_seabios_boot() {
     let edx = machine.cpu.get_reg32(2);
     println!("EDX (2nd param): 0x{:08X}", edx);
     // Check memory at what should be stack with fmt string
+    // Test REP INSB from fw_cfg port
+    {
+        let mut m2 = Machine::new(128 * 1024 * 1024);
+        m2.bios_stubs = false;
+        // 32-bit flat code segment (simulate PM)
+        m2.cpu.mode = kokoa86_cpu::CpuMode::ProtectedMode;
+        m2.cpu.cr0 = 1;
+        m2.cpu.cs = 0x08;
+        m2.cpu.cs_cache = kokoa86_cpu::SegmentCache { selector: 0x08, base: 0, limit: 0xFFFFFFFF, access: 0x9B, flags: 0xC, dpl: 0, big: true, present: true };
+        m2.cpu.ds_cache = kokoa86_cpu::SegmentCache { selector: 0x10, base: 0, limit: 0xFFFFFFFF, access: 0x93, flags: 0xC, dpl: 0, big: true, present: true };
+        m2.cpu.es_cache = m2.cpu.ds_cache;
+        m2.cpu.ss_cache = m2.cpu.ds_cache;
+        m2.cpu.ds = 0x10; m2.cpu.es = 0x10; m2.cpu.ss = 0x10;
+        m2.cpu.esp = 0x7000;
+
+        // Code: select key 0x0019 via OUT DX, AX; then REP INSB to read file dir
+        // MOV DX, 0x510; MOV AX, 0x0019; OUT DX, AX
+        // MOV DX, 0x511; MOV ECX, 200; MOV EDI, 0x2000; REP INSB
+        // HLT
+        m2.load_at(0x7C00, &[
+            0xBA, 0x10, 0x05, 0x00, 0x00, // MOV EDX, 0x00000510
+            0x66, 0xB8, 0x19, 0x00,       // MOV AX, 0x0019 (16-bit with 0x66 prefix)
+            0x66, 0xEF,                   // OUT DX, AX (16-bit)
+            0xBA, 0x11, 0x05, 0x00, 0x00, // MOV EDX, 0x00000511
+            0xB9, 0xC8, 0x00, 0x00, 0x00, // MOV ECX, 200
+            0xBF, 0x00, 0x20, 0x00, 0x00, // MOV EDI, 0x2000
+            0xF3, 0x6C,                   // REP INSB
+            0xF4,                         // HLT
+        ]);
+        m2.cpu.eip = 0x7C00;
+        m2.run().unwrap();
+
+        // Direct fw_cfg read test (bypass CPU)
+        {
+            use kokoa86_dev::port_bus::PortDevice;
+            let mut fw = kokoa86_dev::FwCfg::new(128 * 1024 * 1024);
+            fw.port_out(0x510, 2, 0x0019);
+            let b0 = fw.port_in(0x511, 1);
+            println!("Direct fw_cfg read after SELECT: first byte = 0x{:02X}", b0);
+        }
+
+        // Check CPU state after INSB
+        println!("After INSB: EDI=0x{:08X}, ECX=0x{:08X}", m2.cpu.edi, m2.cpu.ecx);
+        println!("mem[0x2000] = 0x{:02X}", m2.mem.read_u8(0x2000));
+        println!("mem[0x2001] = 0x{:02X}", m2.mem.read_u8(0x2001));
+
+        // Check file count at 0x2000 (4 bytes BE)
+        let count_be = m2.mem.read_u32(0x2000);
+        let count = count_be.swap_bytes(); // BE to LE
+        println!("REP INSB fw_cfg test: file count = {} (raw BE: {:08X})", count, count_be);
+        // Check first file name at 0x2000 + 4 + 4 + 2 + 2 = 0x200C
+        let mut name = [0u8; 20];
+        m2.mem.read_bytes(0x200C, &mut name);
+        println!("  First file name: {:?}", String::from_utf8_lossy(&name));
+    }
+
+    // Quick test: SHL with 0x66 prefix in 16-bit code
+    {
+        let mut m2 = Machine::new(64 * 1024);
+        m2.bios_stubs = false;
+        m2.load_at(0x7C00, &[
+            0x66, 0xB8, 0x07, 0x00, 0x00, 0x00, // MOV EAX, 7
+            0x66, 0xC1, 0xE0, 0x18,              // SHL EAX, 24
+            0xF4,
+        ]);
+        m2.cpu.eip = 0x7C00;
+        m2.run().unwrap();
+        println!("SHL test: EAX=0x{:08X} (expect 0x07000000)", m2.cpu.eax);
+    }
+
+    // Check RamSize global variable at 0x0E9718 (found from ROM analysis)
+    println!("\n=== RamSize check ===");
+    println!("RamSize @ 0x0E9718 = 0x{:08X}", machine.mem.read_u32(0x0E9718));
+
     // Verify fw_cfg file directory
     {
         use kokoa86_dev::port_bus::PortDevice;

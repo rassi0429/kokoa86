@@ -46,7 +46,8 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
             break;
         }
         // Trace normally
-        if false {
+        // Trace around RamSize write at 0xE82D4
+        if machine.cpu.cs_ip() >= 0xE82A0 && machine.cpu.cs_ip() <= 0xE82E0 {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();
             let mut bytes = String::new();
