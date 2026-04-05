@@ -24,7 +24,7 @@ pub struct Machine {
 
 impl Machine {
     pub fn new(ram_size: usize) -> Self {
-        Self {
+        let mut m = Self {
             cpu: CpuState::default(),
             mem: MemoryBus::new(ram_size),
             ports: PortBus::new(),
@@ -38,7 +38,15 @@ impl Machine {
                             if ram_size > 1024*1024 { ((ram_size - 1024*1024) / 1024) as u16 } else { 0 }),
             bios_stubs: true,
             instruction_count: 0,
-        }
+        };
+        // Register misc devices on PortBus
+        m.ports.register(Box::new(kokoa86_dev::misc::PostPort::new()));
+        m.ports.register(Box::new(kokoa86_dev::misc::SystemControlA::new()));
+        m.ports.register(Box::new(kokoa86_dev::misc::SystemControlB::new()));
+        m.ports.register(Box::new(kokoa86_dev::misc::DmaStub::new()));
+        m.ports.register(Box::new(kokoa86_dev::misc::DmaPageRegs::new()));
+        m.ports.register(Box::new(kokoa86_dev::misc::Dma2Stub));
+        m
     }
 
     /// Load binary data at a specific address

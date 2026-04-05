@@ -1,5 +1,6 @@
 pub mod ata;
 pub mod cmos;
+pub mod misc;
 pub mod pic;
 pub mod pit;
 pub mod port_bus;
