@@ -25,8 +25,10 @@ impl FwCfg {
     }
 
     fn init(&mut self, ram_size: u64) {
-        // 0x0000: Signature "QEMU"
-        self.entries.insert(0x0000, b"QEMU".to_vec());
+        // Don't provide QEMU signature — force SeaBIOS to use CMOS path for RAM detection
+        // SeaBIOS checks for "QEMU" at key 0 to detect fw_cfg presence.
+        // Without it, it falls back to pure CMOS-based initialization.
+        // self.entries.insert(0x0000, b"QEMU".to_vec());
 
         // 0x0001: ID (interface version: bit 0 = traditional IO)
         self.entries.insert(0x0001, vec![0x01, 0x00, 0x00, 0x00]);

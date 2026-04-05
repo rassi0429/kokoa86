@@ -111,22 +111,22 @@ pub fn execute(
         }
 
         Opcode::MovAlMem(addr) => {
-            let lin = cpu.linear_addr(cpu.ds, *addr as u16);
+            let lin = data_seg_addr(cpu, *addr);
             cpu.set_reg8(0, mem.read_u8(lin));
             cpu.eip = next_ip;
         }
         Opcode::MovAxMem(addr) => {
-            let lin = cpu.linear_addr(cpu.ds, *addr as u16);
+            let lin = data_seg_addr(cpu, *addr);
             if is32 { cpu.set_reg32(0, mem.read_u32(lin)); } else { cpu.set_reg16(0, mem.read_u16(lin)); }
             cpu.eip = next_ip;
         }
         Opcode::MovMemAl(addr) => {
-            let lin = cpu.linear_addr(cpu.ds, *addr as u16);
+            let lin = data_seg_addr(cpu, *addr);
             mem.write_u8(lin, cpu.get_reg8(0));
             cpu.eip = next_ip;
         }
         Opcode::MovMemAx(addr) => {
-            let lin = cpu.linear_addr(cpu.ds, *addr as u16);
+            let lin = data_seg_addr(cpu, *addr);
             if is32 { mem.write_u32(lin, cpu.get_reg32(0)); } else { mem.write_u16(lin, cpu.get_reg16(0)); }
             cpu.eip = next_ip;
         }
@@ -1591,6 +1591,15 @@ fn write_rm32(cpu: &mut CpuState, mem: &mut MemoryBus, rm: &ModrmOperand, val: u
 
 fn write_rmv(cpu: &mut CpuState, mem: &mut MemoryBus, rm: &ModrmOperand, val: u32, is32: bool) {
     if is32 { write_rm32(cpu, mem, rm, val); } else { write_rm16(cpu, mem, rm, val as u16); }
+}
+
+/// Compute DS:offset linear address (mode-aware)
+fn data_seg_addr(cpu: &CpuState, offset: u32) -> u32 {
+    if cpu.mode == crate::regs::CpuMode::ProtectedMode {
+        cpu.ds_cache.base.wrapping_add(offset)
+    } else {
+        ((cpu.ds as u32) << 4).wrapping_add(offset & 0xFFFF)
+    }
 }
 
 /// Compute stack linear address: SS:SP in real mode, ss_cache.base+ESP in protected

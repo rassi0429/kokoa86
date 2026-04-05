@@ -46,8 +46,9 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
             break;
         }
         // Trace normally
-        // Trace around RamSize write at 0xE82D4
-        if machine.cpu.cs_ip() >= 0xE82A0 && machine.cpu.cs_ip() <= 0xE82E0 {
+        // Trace qemu_preinit and nearby
+        let lip = machine.cpu.cs_ip();
+        if lip >= 0xE8290 && lip <= 0xE82E0 {
             let inst = decode::decode(&machine.cpu, &machine.mem);
             let linear = machine.cpu.cs_ip();
             let mut bytes = String::new();
@@ -55,8 +56,8 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, trace_count: u64) -> Str
                 bytes.push_str(&format!("{:02X} ", machine.mem.read_u8(linear + j)));
             }
             output.push_str(&format!(
-                "TRACE {:5}: {:04X}:{:08X}  {:<30} {:?}  ESP={:08X}\n",
-                i, cs, ip, bytes.trim(), inst.op, machine.cpu.esp
+                "TRACE {:5}: {:04X}:{:08X}  {:<30} {:?}  EAX={:08X} EDX={:08X}\n",
+                i, cs, ip, bytes.trim(), inst.op, machine.cpu.eax, machine.cpu.edx
             ));
             // After instruction 37 (CALL), dump stack
             if i == 37 {
