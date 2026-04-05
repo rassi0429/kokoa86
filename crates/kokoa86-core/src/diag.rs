@@ -58,6 +58,20 @@ pub fn trace_boot(machine: &mut Machine, max_inst: u64, _trace_first: u64) -> St
                 }
             }
         }
+        // Detect while loop condition check
+        let lip_check = machine.cpu.cs_ip();
+        if lip_check == 0x3FFAFE91 {
+            output.push_str(&format!(
+                "[CMP_A @{:>8}] EBX={:08X} [MaxPCI]={:08X}\n",
+                i, machine.cpu.ebx, machine.mem.read_u32(0x3FFCC50C)
+            ));
+        }
+        if lip_check == 0x3FFAFF0C {
+            output.push_str(&format!(
+                "[CMP_B @{:>8}] EBX={:08X} [MaxPCI]={:08X}\n",
+                i, machine.cpu.ebx, machine.mem.read_u32(0x3FFCC50C)
+            ));
+        }
         // Sample every 50M instructions
         if i % 50_000_000 == 0 && i > 0 {
             let lip = machine.cpu.cs_ip();
